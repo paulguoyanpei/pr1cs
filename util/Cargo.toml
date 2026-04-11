@@ -1,0 +1,18 @@
+[package]
+name = "util"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ark-ec = "0.5"
+ark-ff = "0.5"
+rand = "0.8"
+ark-bn254 = "0.5"
+ark-serialize = "0.5"
+ark-poly = "0.5"
+rs_merkle = "1.5"
+blake3 = "1.8"
+
+[[bench]]
+name = "kzg"
+harness = false
