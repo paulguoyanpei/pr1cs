@@ -1,0 +1,101 @@
+use ark_bn254::{Bn254, Fr};
+use ark_ff::{AdditiveGroup, UniformRand};
+use pr1cs::prover::Prover;
+use pr1cs::verifier::Verifier;
+use pr1cs::{circuit::LookupType, instruction::Instruction, program::Program};
+use rand::thread_rng;
+use std::cmp;
+use std::collections::HashSet;
+use util::kzg::Mkzg;
+use util::util::RandomOracle;
+
+const LAYER_COUNT: usize = 1;
+const HIDDEN_DIM: usize = 1 << 8;
+const SEQ_LEN: usize = 1 << 4;
+const INPUT_ALIGN: usize = HIDDEN_DIM * SEQ_LEN;
+
+fn instructions(weight_len: usize) -> Vec<Instruction> {
+    let mut instructions = vec![];
+    let mut weight_start = 1;
+    let mut input_start = weight_len;
+
+    for _ in 0..LAYER_COUNT {
+        instructions.push(Instruction::MatMult {
+            m: SEQ_LEN,
+            n: HIDDEN_DIM,
+            k: HIDDEN_DIM,
+            start1: input_start,
+            start2: weight_start,
+        });
+
+        let matmul_start = input_start + INPUT_ALIGN;
+        for offset in 0..INPUT_ALIGN {
+            instructions.push(Instruction::Quant {
+                input1: vec![(matmul_start + offset, 1)],
+                input2: vec![(0, 1)],
+            });
+        }
+
+        let quant_start = matmul_start + INPUT_ALIGN;
+        for offset in 0..INPUT_ALIGN {
+            instructions.push(Instruction::Lookup {
+                input: vec![(quant_start + offset, 1)],
+                tp: LookupType::Relu,
+            });
+        }
+
+        input_start = quant_start + INPUT_ALIGN;
+        weight_start += HIDDEN_DIM * HIDDEN_DIM;
+    }
+
+    assert_eq!(weight_start, weight_len);
+    instructions
+}
+
+fn main() {
+    let mut rng = thread_rng();
+    let mut weights = vec![1];
+    for _ in 0..LAYER_COUNT {
+        for _ in 0..(1 << 16) {
+            weights.push(1 << 6);
+        }
+    }
+    let weight_len = weights.len();
+
+    let instructions = instructions(weights.len());
+    let program = Program::<Fr>::new(instructions, weights);
+
+    let mut input = vec![];
+    while input.len() < INPUT_ALIGN {
+        input.push(1 << 6);
+    }
+
+    let trace = program.execute(input);
+    assert_eq!(
+        trace.len(),
+        1 + LAYER_COUNT * HIDDEN_DIM * HIDDEN_DIM + INPUT_ALIGN + LAYER_COUNT * INPUT_ALIGN * 3
+    );
+    let aux_start = trace.len();
+
+    let gamma = <Fr as UniformRand>::rand(&mut rng);
+    let z = program.gen_z(weight_len + INPUT_ALIGN, trace, gamma);
+
+    let mut table = vec![];
+    for i in 0..(1 << 6) {
+        table.push((Fr::ZERO, Fr::from(i), Fr::from(1)));
+    }
+    for i in (-(1 << 16) + 1)..(1 << 16) {
+        table.push((Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2)));
+    }
+    let circuit = program.to_circuit(INPUT_ALIGN, aux_start, table);
+    circuit.check(z.clone(), gamma);
+
+    let mut rng = thread_rng();
+    let (kzg_pp, kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
+    let prover = Prover::new(kzg_pp, circuit.clone());
+    let mut ro = RandomOracle::new(&mut rng);
+    let proof = prover.prove(z, gamma, &mut ro);
+    let verifier = Verifier::new(kzg_vp, circuit, weight_len);
+    verifier.verify(proof, gamma, &mut ro);
+    println!("finish DNN!")
+}

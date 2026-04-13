@@ -48,9 +48,7 @@ pub struct SparseMatrix<F: PrimeField> {
 
 impl<F: PrimeField> SparseMatrix<F> {
     pub fn new() -> SparseMatrix<F> {
-        SparseMatrix {
-            rows: vec![],
-        }
+        SparseMatrix { rows: vec![] }
     }
 
     pub fn append(&mut self, row: &Vec<(usize, i64)>) {
@@ -95,8 +93,9 @@ pub struct Circuit<F: PrimeField> {
     pub c: SparseMatrix<F>,
     pub d: SparseMatrix<F>,
     pub e: SparseMatrix<F>,
-    pub tp: Vec<LookupType>,
+    pub tp: Vec<F>,
     pub weight_len: usize,
+    pub table: Vec<(F, F, F)>,
 }
 
 impl<F: PrimeField> Circuit<F> {
@@ -108,6 +107,7 @@ impl<F: PrimeField> Circuit<F> {
         e: SparseMatrix<F>,
         tp: Vec<LookupType>,
         weight_len: usize,
+        table: Vec<(F, F, F)>,
     ) -> Circuit<F> {
         Circuit {
             a,
@@ -115,13 +115,20 @@ impl<F: PrimeField> Circuit<F> {
             c,
             d,
             e,
-            tp,
+            tp: tp
+                .into_iter()
+                .map(|x| match x {
+                    LookupType::Ge0 => F::from(1),
+                    LookupType::Relu => F::from(2),
+                })
+                .collect(),
             weight_len,
+            table,
         }
     }
 
     // testing function
-    pub fn check(&self, z: Vec<F>, gamma: F, set: HashSet<(F, F, F)>) -> bool {
+    pub fn check(&self, z: Vec<F>, gamma: F) -> bool {
         assert_eq!(self.a.len(), self.b.len());
         assert_eq!(self.b.len(), self.c.len());
 
@@ -135,18 +142,23 @@ impl<F: PrimeField> Circuit<F> {
         assert_eq!(self.d.len(), self.e.len());
         assert_eq!(self.e.len(), self.tp.len());
 
+        let set = self.table.clone().into_iter().collect::<HashSet<_>>();
+
         for cr in 0..self.d.len() {
-            match self.tp[cr] {
-                LookupType::Relu => assert!(set.contains(&(
+            if self.tp[cr] == F::from(1) {
+                assert!(set.contains(&(
                     self.d.mult_vec_at(cr, &z, gamma),
                     self.e.mult_vec_at(cr, &z, gamma),
-                    F::ZERO
-                ))),
-                LookupType::Ge0 => assert!(set.contains(&(
+                    F::from(1)
+                )))
+            } else if self.tp[cr] == F::from(2) {
+                assert!(set.contains(&(
                     self.d.mult_vec_at(cr, &z, gamma),
                     self.e.mult_vec_at(cr, &z, gamma),
-                    F::ZERO
-                ))),
+                    F::from(2)
+                )))
+            } else {
+                panic!("undefined lookup type")
             }
         }
         return true;

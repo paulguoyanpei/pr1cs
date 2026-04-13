@@ -22,17 +22,15 @@ impl<F: PrimeField> Program<F> {
         }
     }
 
-    pub fn to_circuit(&self) -> Circuit<F> {
-        let auxiliary_start = 18 << 20;
+    pub fn to_circuit(&self, input_size: usize, aux_start: usize, table: Vec<(F, F, F)>) -> Circuit<F> {
         let mut a = SparseMatrix::<F>::new();
         let mut b = SparseMatrix::<F>::new();
         let mut c = SparseMatrix::<F>::new();
         let mut d = SparseMatrix::<F>::new();
         let mut e = SparseMatrix::<F>::new();
         let mut tp = vec![];
-        assert_eq!(self.weights.len(), 15 << 20);
-        let mut output_index = (15 << 20) + (1 << 12);
-        let mut auxiliary_index = auxiliary_start;
+        let mut output_index = self.weights.len() + input_size;
+        let mut auxiliary_index = aux_start;
 
         for instr in &self.instructions {
             match &instr {
@@ -123,19 +121,13 @@ impl<F: PrimeField> Program<F> {
             }
         }
 
-        return Circuit::<F>::new(a, b, c, d, e, tp, self.weights.len());
+        return Circuit::<F>::new(a, b, c, d, e, tp, self.weights.len(), table);
     }
 
     pub fn weights(&self) -> Vec<F> {
         self.weights.iter().map(|&x| F::from(x)).collect()
     }
 
-    // layout of z
-    // z[0] = 1
-    // z[1, 15*2^{20}) CNN weights
-    // z[15 * 2^{20}, 15 * 2^{20} + 2^{12}) input
-    // z[15 * 2^{20}, 18 * 2^{20}) trace, input is part of trace
-    // z[18 * 2^{20}, 19 * 2^{20}) auxiliary
     pub fn execute(&self, mut input: Vec<i64>) -> Vec<F> {
         // execute the prgram, generate the whole traces
         let mut z = self.weights.clone();
@@ -225,23 +217,14 @@ impl<F: PrimeField> Program<F> {
             }
         }
 
-        let mut res = vec![];
-        for i in 0..10 {
-            res.push(z[z.len() - 10 + i]);
-        }
-
         z.iter().map(|&x| F::from(x)).collect::<Vec<_>>()
     }
 
-    pub fn gen_z(&self, trace: Vec<F>, gamma: F) -> Vec<F> {
+    pub fn gen_z(&self, output_start: usize, trace: Vec<F>, gamma: F) -> Vec<F> {
         let mut z = trace.clone();
-        assert!(z.len() < 18 << 20);
-        z.resize(18 << 20, F::zero());
-
-        assert_eq!(z.len(), 18 << 20);
         let mut aux = vec![];
 
-        let mut output_index = (15 << 20) + (1 << 12);
+        let mut output_index = output_start;
         for instr in &self.instructions {
             match &instr {
                 &Instruction::AddMult { input1, input2 } => {

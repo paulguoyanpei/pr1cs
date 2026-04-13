@@ -3,7 +3,7 @@ use ark_ff::{Field, One, UniformRand, Zero};
 use rand::Rng;
 use std::marker::PhantomData;
 
-use crate::{oracle::RandomOracle, poly::MlPoly};
+use crate::{util::RandomOracle, poly::MlPoly};
 
 pub const LOG_CHUNK_NUM: usize = 4;
 pub struct Mkzg<E: Pairing>(PhantomData<E>);
@@ -261,7 +261,7 @@ mod tests {
 
     use crate::{
         kzg::{LOG_CHUNK_NUM, Mkzg},
-        oracle::RandomOracle,
+        util::RandomOracle,
         poly::MlPoly,
     };
 

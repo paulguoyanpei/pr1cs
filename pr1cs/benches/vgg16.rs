@@ -1,11 +1,13 @@
-use ark_bn254::Fr;
+use ark_bn254::{Bn254, Fr};
 use ark_ff::{AdditiveGroup, UniformRand};
+use pr1cs::prover::Prover;
 use pr1cs::{circuit::LookupType, instruction::Instruction, program::Program};
 use rand::thread_rng;
 use std::cmp;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use util::kzg::{Mkzg, MkzgProveParams};
+use util::util::RandomOracle;
 const KERNEL_SIZE: usize = 3;
 
 enum Layer {
@@ -294,19 +296,27 @@ fn main() {
     }
 
     let trace = program.execute(input);
+    let aux_start = trace.len();
 
     let mut rng = thread_rng();
     let gamma = <Fr as UniformRand>::rand(&mut rng);
-    let z = program.gen_z(trace, gamma);
+    let z = program.gen_z(WEIGHT_ALIGN, trace, gamma);
 
-    let circuit = program.to_circuit();
-
-    let mut set = HashSet::new();
-    for i in (-(1 << 16) + 1)..(1 << 16) {
-        set.insert((Fr::from(i), Fr::from(cmp::max(0, i)), Fr::ZERO));
-    }
+    let mut table = vec![];
     for i in 0..(1 << 6) {
-        set.insert((Fr::ZERO, Fr::from(i), Fr::ZERO));
+        table.push((Fr::ZERO, Fr::from(i), Fr::from(1)));
     }
-    circuit.check(z, gamma, set);
+    for i in (-(1 << 16) + 1)..(1 << 16) {
+        table.push((Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2)));
+    }
+
+    let circuit = program.to_circuit(INPUT_ALIGN, aux_start, table);
+
+    circuit.check(z.clone(), gamma);
+
+    let mut rng = thread_rng();
+    let (kzg_pp, kzp_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
+    let prover = Prover::new(kzg_pp, circuit);
+    let mut ro = RandomOracle::new(&mut rng);
+    prover.prove(z, gamma, &mut ro);
 }

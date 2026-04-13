@@ -61,93 +61,55 @@ impl<F: Field> MlPoly<F> {
         MlPoly(evals)
     }
 
-    pub fn eval_eq(point1: &Vec<F>, point2: &Vec<F>) -> F {
+    pub fn eval_eq(r: &Vec<F>, point: &Vec<F>) -> F {
         let mut res = F::one();
-        for (&i, &j) in point1.iter().zip(point2.iter()) {
+        for (&i, &j) in r.iter().zip(point.iter()) {
             res *= i * j + (F::one() - i) * (F::one() - j);
         }
         res
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct UniVarPoly<F: Field>(Vec<F>);
+    pub fn eval_eq_pref(r: &Vec<F>, point: &Vec<F>, n: usize) -> F {
+        let k = r.len();
+        let m = point.len();
+        let one = F::one();
 
-impl<F: Field> UniVarPoly<F> {
-    pub fn new(coeff: Vec<F>) -> Self {
-        UniVarPoly(coeff)
-    }
-
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut bytes = vec![];
-        self.0
-            .iter()
-            .for_each(|x| <F as CanonicalSerialize>::serialize_compressed(&x, &mut bytes).unwrap());
-        bytes
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn eval(&self, point: &F) -> F {
-        let mut res = self.0.last().unwrap().clone();
-        for i in self.0.iter().rev().skip(1) {
-            res *= point;
-            res += i;
+        // Suffix: prod(1 - r[i]) for i = m..k, from bits that are always 0
+        let mut suffix = one;
+        for i in m..k {
+            suffix *= one - r[i];
         }
-        res
-    }
-}
 
-#[derive(Debug, Clone)]
-pub struct UniPolyEvals<F: Field> {
-    evals: Vec<F>,
-    offset_inv: F,
-}
-
-impl<F: FftField> UniPolyEvals<F> {
-    pub fn new(evals: Vec<F>, offset_inv: F) -> UniPolyEvals<F> {
-        UniPolyEvals { evals, offset_inv }
-    }
-
-    pub fn len(&self) -> usize {
-        self.evals.len()
-    }
-
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut bytes = vec![];
-        self.evals
-            .iter()
-            .for_each(|x| <F as CanonicalSerialize>::serialize_compressed(&x, &mut bytes).unwrap());
-        bytes
-    }
-
-    pub fn n_th_eval(&self, n: usize) -> F {
-        self.evals[n & (self.evals.len() - 1)]
-    }
-
-    pub fn eval(self, mut point: F, mut root_inv: F, inv_2: F) -> F {
-        let UniPolyEvals {
-            mut evals,
-            mut offset_inv,
-        } = self;
-        let mut len = evals.len();
-        let mut inv = <F as One>::one();
-        for _ in 0..evals.len().ilog2() {
-            len >>= 1;
-            let mut w = offset_inv;
-            for j in 0..len {
-                let t = (evals[j] - evals[j + len]) * point * w;
-                evals[j] = evals[j] + evals[j + len] + t;
-                w *= root_inv;
+        // If n >= 2^m, we sum over all 2^m indices => full eval_eq on first m vars
+        if n >= (1usize << m) {
+            let mut res = one;
+            for i in 0..m {
+                res *= r[i] * point[i] + (one - r[i]) * (one - point[i]);
             }
-            offset_inv *= offset_inv;
-            inv *= inv_2;
-            point *= point;
-            root_inv *= root_inv;
+            return res * suffix;
         }
-        evals[0] * inv
+
+        // Precompute prefix products: P[i] = prod(eq_rp[0..i])
+        let mut prefix_prod = vec![one; m + 1];
+        for i in 0..m {
+            let eq_rp = r[i] * point[i] + (one - r[i]) * (one - point[i]);
+            prefix_prod[i + 1] = prefix_prod[i] * eq_rp;
+        }
+
+        // Process bits of n from MSB to LSB
+        let mut result = F::ZERO;
+        let mut carry = one;
+        for bit in (0..m).rev() {
+            let phi_0 = (one - r[bit]) * (one - point[bit]);
+            if (n >> bit) & 1 == 1 {
+                result += carry * phi_0 * prefix_prod[bit];
+                carry *= r[bit] * point[bit];
+            } else {
+                carry *= phi_0;
+            }
+        }
+
+        result * suffix
     }
 }
 
@@ -175,5 +137,31 @@ mod tests {
         assert_eq!(v, v2);
         let point2 = (0..nv).map(|_| Fr::rand(&mut rng)).collect::<Vec<_>>();
         assert_eq!(eq_poly.eval(&point2), MlPoly::eval_eq(&point, &point2));
+    }
+
+    #[test]
+    fn test_eval_eq_pref() {
+        let k = 10;
+        let mut rng = thread_rng();
+        let r: Vec<Fr> = (0..k).map(|_| Fr::rand(&mut rng)).collect();
+        let eq_poly = MlPoly::new_eq(&r);
+
+        // Test various values of n (n >= 2 since MlPoly::new panics on len=1)
+        for n in [2, 3, 5, 7, 8, 13, 100, 511, 512, 1000, 1024] {
+            let m = (u32::BITS - (n as u32 - 1).leading_zeros()) as usize;
+            let point: Vec<Fr> = (0..m).map(|_| Fr::rand(&mut rng)).collect();
+
+            // Naive: materialize first n evals, pad to 2^m, evaluate
+            let naive = MlPoly::new(eq_poly.0[..n].to_vec()).eval(&point);
+
+            // Fast
+            let fast = MlPoly::<Fr>::eval_eq_pref(&r, &point, n);
+
+            assert_eq!(naive, fast, "mismatch at n={}", n);
+        }
+
+        // Test n=0
+        let point1: Vec<Fr> = (0..1).map(|_| Fr::rand(&mut rng)).collect();
+        assert_eq!(MlPoly::<Fr>::eval_eq_pref(&r, &point1, 0), Fr::ZERO);
     }
 }
