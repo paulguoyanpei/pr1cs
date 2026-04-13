@@ -5,49 +5,55 @@ use ark_serialize::CanonicalSerialize;
 pub struct MlPoly<F: Field>(pub Vec<F>);
 
 impl<F: Field> MlPoly<F> {
-    pub fn new(mut v: Vec<F>) -> MlPoly<F> {
-        let log_len = (v.len() - 1).ilog2() + 1;
-        let len = 1usize << log_len;
-        while v.len() < len {
-            v.push(F::ZERO);
-        }
+    pub fn new(v: Vec<F>) -> MlPoly<F> {
         MlPoly(v)
     }
 
     pub fn eval(self, point: &[F]) -> F {
         let mut scratch = self.0;
-        let mut cur_len = scratch.len() >> 1;
-        assert_eq!(1 << point.len(), scratch.len());
+        assert!(scratch.len() <= 1 << point.len());
         for r in point.iter() {
-            for i in 0..cur_len {
-                scratch[i] = scratch[i * 2] + (scratch[i * 2 + 1] - scratch[i * 2]) * (*r);
+            let cur_len = scratch.len();
+            let new_len = (cur_len + 1) / 2;
+            for i in 0..new_len {
+                if i * 2 + 1 < cur_len {
+                    scratch[i] = scratch[i * 2] + (scratch[i * 2 + 1] - scratch[i * 2]) * (*r);
+                } else {
+                    scratch[i] = scratch[i * 2] * (F::ONE - *r);
+                }
             }
-            cur_len >>= 1;
+            scratch.truncate(new_len);
         }
         scratch[0]
     }
 
     pub fn split(&self, n: usize) -> Vec<MlPoly<F>> {
-        assert_eq!(n & (n - 1), 0);
-        let mut polies = (0..n).map(|_| vec![]).collect::<Vec<_>>();
         let len = self.0.len();
-        for i in (0..len).step_by(n) {
-            for j in 0..n {
-                polies[j].push(self.0[i + j]);
-            }
+        let num_chunks = (len + n - 1) / n;
+        let mut polies = Vec::with_capacity(num_chunks);
+        for i in 0..num_chunks {
+            let start = i * n;
+            let end = std::cmp::min(start + n, len);
+            let mut chunk = self.0[start..end].to_vec();
+            chunk.resize(n, F::ZERO);
+            polies.push(MlPoly(chunk));
         }
-        polies.into_iter().map(|x| MlPoly(x)).collect()
+        polies
     }
 
     pub fn fold(&mut self, point: &[F]) {
-        let mut cur_len = self.0.len();
         for r in point.iter() {
-            cur_len >>= 1;
-            for i in 0..cur_len {
-                self.0[i] = self.0[i * 2] + (self.0[i * 2 + 1] - self.0[i * 2]) * (*r);
+            let cur_len = self.0.len();
+            let new_len = (cur_len + 1) / 2;
+            for i in 0..new_len {
+                if i * 2 + 1 < cur_len {
+                    self.0[i] = self.0[i * 2] + (self.0[i * 2 + 1] - self.0[i * 2]) * (*r);
+                } else {
+                    self.0[i] = self.0[i * 2] * (F::ONE - *r);
+                }
             }
+            self.0.truncate(new_len);
         }
-        self.0.truncate(cur_len);
     }
 
     pub fn new_eq(point: &Vec<F>) -> Self {
@@ -146,8 +152,7 @@ mod tests {
         let r: Vec<Fr> = (0..k).map(|_| Fr::rand(&mut rng)).collect();
         let eq_poly = MlPoly::new_eq(&r);
 
-        // Test various values of n (n >= 2 since MlPoly::new panics on len=1)
-        for n in [2, 3, 5, 7, 8, 13, 100, 511, 512, 1000, 1024] {
+        for n in [1, 2, 3, 5, 7, 8, 13, 100, 511, 512, 1000, 1024] {
             let m = (u32::BITS - (n as u32 - 1).leading_zeros()) as usize;
             let point: Vec<Fr> = (0..m).map(|_| Fr::rand(&mut rng)).collect();
 

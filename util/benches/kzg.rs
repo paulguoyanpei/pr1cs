@@ -5,7 +5,7 @@ use ark_ec::pairing::Pairing;
 use ark_ff::UniformRand;
 use rand::thread_rng;
 use util::{
-    kzg::{LOG_CHUNK_NUM, Mkzg, MkzgProveParams, MkzgVerParams},
+    kzg::{LOG_CHUNK_SIZE, Mkzg, MkzgProveParams, MkzgVerParams},
     poly::MlPoly,
 };
 
@@ -17,8 +17,8 @@ fn main() {
 
 fn bench_kzg<E: Pairing>(pp: &MkzgProveParams<E>, vp: &MkzgVerParams<E>, nv: usize) {
     let mut rng = thread_rng();
-    let pp = pp.trim(nv - LOG_CHUNK_NUM);
-    let vp = vp.trim(nv - LOG_CHUNK_NUM);
+    let pp = pp.trim(LOG_CHUNK_SIZE);
+    let vp = vp.trim(LOG_CHUNK_SIZE);
     let poly = MlPoly(
         (0..1 << nv)
             .map(|_| <E::ScalarField as UniformRand>::rand(&mut rng))

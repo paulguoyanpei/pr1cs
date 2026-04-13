@@ -5,10 +5,10 @@ use std::marker::PhantomData;
 
 use crate::{util::RandomOracle, poly::MlPoly};
 
-pub const LOG_CHUNK_NUM: usize = 4;
+pub const LOG_CHUNK_SIZE: usize = 4;
 pub struct Mkzg<E: Pairing>(PhantomData<E>);
 #[derive(Debug, Clone)]
-pub struct MkzgCommit<E: Pairing>([E::G1; 1 << LOG_CHUNK_NUM]);
+pub struct MkzgCommit<E: Pairing>(pub Vec<E::G1>);
 #[derive(Debug, Clone)]
 pub struct MkzgProof<E: Pairing>(Vec<E::G1>);
 pub struct SumcheckProof<F: Field>(Vec<F>);
@@ -69,31 +69,52 @@ impl<E: Pairing> Mkzg<E> {
     }
 
     pub fn commit(srs: &MkzgProveParams<E>, poly: &MlPoly<E::ScalarField>) -> MkzgCommit<E> {
-        if srs.0.len() != poly.0.len() >> LOG_CHUNK_NUM {
-            panic!("{} {}", file!(), line!());
-        }
-        let polies = poly.split(1 << LOG_CHUNK_NUM);
+        let chunk_size = srs.0.len();
+        let polies = poly.split(chunk_size);
         let mut commits = vec![];
         for p in polies {
             commits.push(E::G1::msm_unchecked(&srs.0, &p.0));
         }
-        MkzgCommit(commits.try_into().unwrap())
+        MkzgCommit(commits)
     }
 
     pub fn open(
         srs: &MkzgProveParams<E>,
         mut poly: MlPoly<E::ScalarField>,
-        mut point: Vec<E::ScalarField>,
+        point: Vec<E::ScalarField>,
     ) -> (MkzgProof<E>, E::ScalarField) {
-        assert_eq!(srs.0.len() << LOG_CHUNK_NUM, 1 << point.len());
-        poly.fold(&point[0..LOG_CHUNK_NUM]);
-        point = point[LOG_CHUNK_NUM..].to_vec();
+        let chunk_size = srs.0.len();
+        let log_chunk_size = chunk_size.ilog2() as usize;
+
+        // First log_chunk_size variables are KZG (within-chunk),
+        // remaining variables are chunk selectors (upper bits).
+        let kzg_point = point[..log_chunk_size].to_vec();
+        let chunk_point = point[log_chunk_size..].to_vec();
+
+        // Fold chunk dimension (strided fold over upper variables)
+        for r in chunk_point.iter() {
+            let num_chunks = (poly.0.len() + chunk_size - 1) / chunk_size;
+            let new_num = (num_chunks + 1) / 2;
+            for i in 0..new_num {
+                for j in 0..chunk_size {
+                    let idx0 = i * 2 * chunk_size + j;
+                    let idx1 = (i * 2 + 1) * chunk_size + j;
+                    let v0 = if idx0 < poly.0.len() { poly.0[idx0] } else { E::ScalarField::zero() };
+                    let v1 = if idx1 < poly.0.len() { poly.0[idx1] } else { E::ScalarField::zero() };
+                    poly.0[i * chunk_size + j] = v0 + (v1 - v0) * (*r);
+                }
+            }
+            poly.0.truncate(new_num * chunk_size);
+        }
+
+        // Pad to chunk_size if needed
+        poly.0.resize(chunk_size, E::ScalarField::zero());
 
         let one = E::ScalarField::one();
-        let mul = point
+        let mul = kzg_point
             .iter()
             .fold(E::ScalarField::from(1), |acc, x| acc * (one - x));
-        let point = point
+        let kzg_point = kzg_point
             .iter()
             .map(|&x| x * Field::inverse(&(one - x)).unwrap())
             .collect::<Vec<_>>();
@@ -102,7 +123,7 @@ impl<E: Pairing> Mkzg<E> {
         let mut poly = poly.0;
         assert_eq!(poly.len(), srs.0.len());
         let mut bases = srs.0.clone();
-        for p in point.iter() {
+        for p in kzg_point.iter() {
             let mut scalars = vec![];
             for i in 0..cur_len {
                 bases[i] = bases[i * 2];
@@ -127,8 +148,9 @@ impl<E: Pairing> Mkzg<E> {
     ) -> (MkzgProof<E>, SumcheckProof<E::ScalarField>) {
         let mut sumcheck_proof = vec![];
         let r = oracle.next_field();
-        let nv = poly.0.len().ilog2() as usize;
-        let mut eq_acc = vec![E::ScalarField::zero(); 1 << nv];
+        let len = poly.0.len();
+        let nv = if len <= 1 { 1 } else { (len - 1).ilog2() as usize + 1 };
+        let mut eq_acc = vec![E::ScalarField::zero(); len];
         for i in point.iter() {
             let eq = MlPoly::new_eq(i);
             for (j, k) in eq_acc.iter_mut().zip(eq.0.into_iter()) {
@@ -139,8 +161,12 @@ impl<E: Pairing> Mkzg<E> {
         let mut r_point = vec![];
 
         let mut poly_evals = poly.0.clone();
-        for i in 0..nv {
-            let m = 1usize << (nv - i);
+        for _ in 0..nv {
+            if poly_evals.len() % 2 == 1 {
+                poly_evals.push(E::ScalarField::zero());
+                eq_acc.push(E::ScalarField::zero());
+            }
+            let m = poly_evals.len();
             let sums =
                 (0..m)
                     .step_by(2)
@@ -161,14 +187,14 @@ impl<E: Pairing> Mkzg<E> {
             }
             let challenge = oracle.next_field();
             r_point.push(challenge);
-            let m = m >> 1;
-            for j in 0..m {
+            let new_m = m / 2;
+            for j in 0..new_m {
                 poly_evals[j] =
                     poly_evals[j * 2] + (poly_evals[j * 2 + 1] - poly_evals[j * 2]) * challenge;
                 eq_acc[j] = eq_acc[j * 2] + (eq_acc[j * 2 + 1] - eq_acc[j * 2]) * challenge;
             }
-            poly_evals.truncate(m);
-            eq_acc.truncate(m);
+            poly_evals.truncate(new_m);
+            eq_acc.truncate(new_m);
         }
         let (proof, _) = Self::open(srs, poly, r_point);
         (proof, SumcheckProof(sumcheck_proof))
@@ -217,36 +243,48 @@ impl<E: Pairing> Mkzg<E> {
 
     pub fn verify(
         vp: &MkzgVerParams<E>,
-        mut point: Vec<E::ScalarField>,
+        point: Vec<E::ScalarField>,
         comm: &MkzgCommit<E>,
         value: E::ScalarField,
         proof: MkzgProof<E>,
     ) -> bool {
-        let point2 = point.split_off(LOG_CHUNK_NUM);
+        let log_chunk_size = vp.params.len();
+
+        // First log_chunk_size variables are KZG (within-chunk),
+        // remaining are chunk selectors.
+        let kzg_point = &point[..log_chunk_size];
+        let chunk_point = &point[log_chunk_size..];
+
         let one = E::ScalarField::one();
-        let mul = point2
+        let mul = kzg_point
             .iter()
             .fold(E::ScalarField::from(1), |acc, x| acc * (one - x));
-        let point2 = point2
+        let kzg_point_transformed: Vec<_> = kzg_point
             .iter()
             .map(|&x| x * Field::inverse(&(one - x)).unwrap())
-            .collect::<Vec<_>>();
+            .collect();
         let value = value * mul.inverse().unwrap();
         let MkzgVerParams { g, h, mut params } = vp.clone();
-        for i in 0..point2.len() {
-            params[i] -= h * point2[i];
+        for i in 0..kzg_point_transformed.len() {
+            params[i] -= h * kzg_point_transformed[i];
         }
         let mut proof = proof.0;
         proof.push(g);
         params.push(h * value);
 
-        let mut commits = comm.0;
-        let mut cur_len = commits.len() >> 1;
-        for r in point.iter() {
-            for i in 0..cur_len {
-                commits[i] = commits[i * 2] + (commits[i * 2 + 1] - commits[i * 2]) * (*r);
+        // Fold commits using chunk-selector variables
+        let mut commits = comm.0.clone();
+        for r in chunk_point.iter() {
+            let cur_len = commits.len();
+            let new_len = (cur_len + 1) / 2;
+            for i in 0..new_len {
+                if i * 2 + 1 < cur_len {
+                    commits[i] = commits[i * 2] + (commits[i * 2 + 1] - commits[i * 2]) * (*r);
+                } else {
+                    commits[i] = commits[i * 2] * (one - *r);
+                }
             }
-            cur_len >>= 1;
+            commits.truncate(new_len);
         }
 
         E::multi_pairing(proof, params) == E::pairing(commits[0], h)
@@ -260,7 +298,7 @@ mod tests {
     use rand::thread_rng;
 
     use crate::{
-        kzg::{LOG_CHUNK_NUM, Mkzg},
+        kzg::{LOG_CHUNK_SIZE, Mkzg},
         util::RandomOracle,
         poly::MlPoly,
     };
@@ -275,8 +313,8 @@ mod tests {
                 .collect(),
         );
         let (pp, vp) = Mkzg::<Bn254>::gen_srs(10, &mut rng);
-        let pp = pp.trim(log_len - LOG_CHUNK_NUM);
-        let vp = vp.trim(log_len - LOG_CHUNK_NUM);
+        let pp = pp.trim(LOG_CHUNK_SIZE);
+        let vp = vp.trim(LOG_CHUNK_SIZE);
         let commit = Mkzg::commit(&pp, &poly);
         let point = (0..10)
             .map(|_| {
