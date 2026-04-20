@@ -3,9 +3,9 @@ use ark_ff::{Field, One, UniformRand, Zero};
 use rand::Rng;
 use std::marker::PhantomData;
 
-use crate::{util::RandomOracle, poly::MlPoly};
+use crate::{poly::MlPoly, util::RandomOracle};
 
-pub const LOG_CHUNK_SIZE: usize = 4;
+pub const LOG_CHUNK_SIZE: usize = 10;
 pub struct Mkzg<E: Pairing>(PhantomData<E>);
 #[derive(Debug, Clone)]
 pub struct MkzgCommit<E: Pairing>(pub Vec<E::G1>);
@@ -99,8 +99,16 @@ impl<E: Pairing> Mkzg<E> {
                 for j in 0..chunk_size {
                     let idx0 = i * 2 * chunk_size + j;
                     let idx1 = (i * 2 + 1) * chunk_size + j;
-                    let v0 = if idx0 < poly.0.len() { poly.0[idx0] } else { E::ScalarField::zero() };
-                    let v1 = if idx1 < poly.0.len() { poly.0[idx1] } else { E::ScalarField::zero() };
+                    let v0 = if idx0 < poly.0.len() {
+                        poly.0[idx0]
+                    } else {
+                        E::ScalarField::zero()
+                    };
+                    let v1 = if idx1 < poly.0.len() {
+                        poly.0[idx1]
+                    } else {
+                        E::ScalarField::zero()
+                    };
                     poly.0[i * chunk_size + j] = v0 + (v1 - v0) * (*r);
                 }
             }
@@ -142,44 +150,74 @@ impl<E: Pairing> Mkzg<E> {
 
     pub fn batch_open(
         srs: &MkzgProveParams<E>,
-        poly: MlPoly<E::ScalarField>,
-        point: Vec<Vec<E::ScalarField>>,
+        polys: &[MlPoly<E::ScalarField>],
+        points: &[Vec<E::ScalarField>],
         oracle: &mut RandomOracle<E::ScalarField>,
     ) -> (MkzgProof<E>, SumcheckProof<E::ScalarField>) {
+        let k = polys.len();
+        assert_eq!(k, points.len());
+        assert!(k > 0);
         let mut sumcheck_proof = vec![];
         let r = oracle.next_field();
-        let len = poly.0.len();
-        let nv = if len <= 1 { 1 } else { (len - 1).ilog2() as usize + 1 };
-        let mut eq_acc = vec![E::ScalarField::zero(); len];
-        for i in point.iter() {
-            let eq = MlPoly::new_eq(i);
-            for (j, k) in eq_acc.iter_mut().zip(eq.0.into_iter()) {
-                *j *= r;
-                *j += k
+
+        let nv = polys
+            .iter()
+            .zip(points.iter())
+            .map(|(poly, pt)| {
+                let len = poly.0.len();
+                let poly_nv = if len <= 1 {
+                    1
+                } else {
+                    (len - 1).ilog2() as usize + 1
+                };
+                poly_nv.max(pt.len())
+            })
+            .max()
+            .unwrap();
+        let full_len = 1usize << nv;
+
+        // r_powers[i] = r^{k-1-i} (Horner ordering)
+        let mut r_powers = vec![E::ScalarField::one(); k];
+        {
+            let mut rp = E::ScalarField::one();
+            for i in (0..k).rev() {
+                r_powers[i] = rp;
+                rp *= r;
             }
         }
-        let mut r_point = vec![];
 
-        let mut poly_evals = poly.0.clone();
-        for _ in 0..nv {
-            if poly_evals.len() % 2 == 1 {
-                poly_evals.push(E::ScalarField::zero());
-                eq_acc.push(E::ScalarField::zero());
-            }
-            let m = poly_evals.len();
+        // Per-polynomial eq and poly evaluations
+        let mut eq_evals: Vec<Vec<E::ScalarField>> = Vec::with_capacity(k);
+        let mut poly_evals_arr: Vec<Vec<E::ScalarField>> = Vec::with_capacity(k);
+        for i in 0..k {
+            let mut padded_point = points[i].clone();
+            padded_point.resize(nv, E::ScalarField::zero());
+            let eq = MlPoly::new_eq(&padded_point);
+            eq_evals.push(eq.0);
+
+            let mut pe = polys[i].0.clone();
+            pe.resize(full_len, E::ScalarField::zero());
+            poly_evals_arr.push(pe);
+        }
+
+        let mut r_point = vec![];
+        for round in 0..nv {
+            let m = 1usize << (nv - round);
             let sums =
                 (0..m)
                     .step_by(2)
                     .fold([<E::ScalarField as Zero>::zero(); 3], |mut acc, x| {
-                        let v00 = poly_evals[x];
-                        let v01 = poly_evals[x + 1];
-                        let v02 = v01 + v01 - v00;
-                        let v10 = eq_acc[x];
-                        let v11 = eq_acc[x + 1];
-                        let v12 = v11 + v11 - v10;
-                        acc[0] += v00 * v10;
-                        acc[1] += v01 * v11;
-                        acc[2] += v02 * v12;
+                        for i in 0..k {
+                            let v00 = poly_evals_arr[i][x];
+                            let v01 = poly_evals_arr[i][x + 1];
+                            let v02 = v01 + v01 - v00;
+                            let v10 = eq_evals[i][x];
+                            let v11 = eq_evals[i][x + 1];
+                            let v12 = v11 + v11 - v10;
+                            acc[0] += r_powers[i] * v00 * v10;
+                            acc[1] += r_powers[i] * v01 * v11;
+                            acc[2] += r_powers[i] * v02 * v12;
+                        }
                         acc
                     });
             for j in 0..3 {
@@ -187,34 +225,66 @@ impl<E: Pairing> Mkzg<E> {
             }
             let challenge = oracle.next_field();
             r_point.push(challenge);
-            let new_m = m / 2;
-            for j in 0..new_m {
-                poly_evals[j] =
-                    poly_evals[j * 2] + (poly_evals[j * 2 + 1] - poly_evals[j * 2]) * challenge;
-                eq_acc[j] = eq_acc[j * 2] + (eq_acc[j * 2 + 1] - eq_acc[j * 2]) * challenge;
+            let m = m >> 1;
+            for j in 0..m {
+                for i in 0..k {
+                    poly_evals_arr[i][j] = poly_evals_arr[i][j * 2]
+                        + (poly_evals_arr[i][j * 2 + 1] - poly_evals_arr[i][j * 2]) * challenge;
+                    eq_evals[i][j] = eq_evals[i][j * 2]
+                        + (eq_evals[i][j * 2 + 1] - eq_evals[i][j * 2]) * challenge;
+                }
             }
-            poly_evals.truncate(new_m);
-            eq_acc.truncate(new_m);
+            for i in 0..k {
+                poly_evals_arr[i].truncate(m);
+                eq_evals[i].truncate(m);
+            }
         }
-        let (proof, _) = Self::open(srs, poly, r_point);
+
+        // Combined polynomial H(x) = Σ_i w_i * f_i(x)
+        // where w_i = r_powers[i] * eq(z_i_padded, r_point)
+        let max_len = polys.iter().map(|p| p.0.len()).max().unwrap();
+        let mut combined = vec![E::ScalarField::zero(); max_len];
+        for i in 0..k {
+            let w = r_powers[i] * eq_evals[i][0];
+            for j in 0..polys[i].0.len() {
+                combined[j] += w * polys[i].0[j];
+            }
+        }
+
+        let (proof, _) = Self::open(srs, MlPoly(combined), r_point);
         (proof, SumcheckProof(sumcheck_proof))
     }
 
     pub fn batch_verify(
         vp: &MkzgVerParams<E>,
-        point: Vec<Vec<E::ScalarField>>,
-        comm: &MkzgCommit<E>,
-        value: Vec<E::ScalarField>,
+        points: &[Vec<E::ScalarField>],
+        comms: &[MkzgCommit<E>],
+        values: &[E::ScalarField],
         proof: (MkzgProof<E>, SumcheckProof<E::ScalarField>),
         oracle: &mut RandomOracle<E::ScalarField>,
     ) -> bool {
-        let nv = point[0].len();
+        let k = points.len();
+        assert_eq!(k, comms.len());
+        assert_eq!(k, values.len());
+
+        let nv = points.iter().map(|p| p.len()).max().unwrap_or(1);
         let r = oracle.next_field();
+
         let mut y = E::ScalarField::zero();
-        for i in value.into_iter() {
+        for &v in values.iter() {
             y *= r;
-            y += i;
+            y += v;
         }
+
+        let mut r_powers = vec![E::ScalarField::one(); k];
+        {
+            let mut rp = E::ScalarField::one();
+            for i in (0..k).rev() {
+                r_powers[i] = rp;
+                rp *= r;
+            }
+        }
+
         let mut r_point = vec![];
         let (kzg_proof, sumcheck_proof) = proof;
         let one_over_two = E::ScalarField::from(2).inverse().unwrap();
@@ -233,12 +303,33 @@ impl<E: Pairing> Mkzg<E> {
                 + challenge * (-three_over_two * sum[0] + sum[1] + sum[1] - one_over_two * sum[2])
                 + challenge * challenge * (one_over_two * sum[0] - sum[1] + one_over_two * sum[2]);
         }
-        let mut eq_r = E::ScalarField::zero();
-        for i in point.into_iter() {
-            eq_r *= r;
-            eq_r += MlPoly::eval_eq(&i, &r_point);
-        }
-        Self::verify(vp, r_point, comm, y * eq_r.inverse().unwrap(), kzg_proof)
+
+        // weights[i] = r_powers[i] * eq(z_i_padded, r_point)
+        let weights: Vec<_> = (0..k)
+            .map(|i| {
+                let mut padded = points[i].clone();
+                padded.resize(nv, E::ScalarField::zero());
+                r_powers[i] * MlPoly::eval_eq(&padded, &r_point)
+            })
+            .collect();
+
+        // Combined commitment: for each chunk, Σ_i w_i * comm_i[chunk]
+        let max_chunks = comms.iter().map(|c| c.0.len()).max().unwrap_or(0);
+        let combined_commit = MkzgCommit(
+            (0..max_chunks)
+                .map(|chunk_idx| {
+                    let mut sum: E::G1 = Zero::zero();
+                    for i in 0..k {
+                        if chunk_idx < comms[i].0.len() {
+                            sum += comms[i].0[chunk_idx] * weights[i];
+                        }
+                    }
+                    sum
+                })
+                .collect(),
+        );
+
+        Self::verify(vp, r_point, &combined_commit, y, kzg_proof)
     }
 
     pub fn verify(
@@ -299,39 +390,81 @@ mod tests {
 
     use crate::{
         kzg::{LOG_CHUNK_SIZE, Mkzg},
-        util::RandomOracle,
         poly::MlPoly,
+        util::RandomOracle,
     };
 
     #[test]
     fn it_works() {
-        let log_len = 8;
+        let log_len = 12;
         let mut rng = thread_rng();
         let poly = MlPoly(
-            (0..1 << log_len)
+            (0..(1 << log_len) - 100)
                 .map(|_| <Fr as UniformRand>::rand(&mut rng))
                 .collect(),
         );
-        let (pp, vp) = Mkzg::<Bn254>::gen_srs(10, &mut rng);
-        let pp = pp.trim(LOG_CHUNK_SIZE);
-        let vp = vp.trim(LOG_CHUNK_SIZE);
+        let (pp, vp) = Mkzg::<Bn254>::gen_srs(LOG_CHUNK_SIZE, &mut rng);
         let commit = Mkzg::commit(&pp, &poly);
-        let point = (0..10)
+        let points: Vec<Vec<Fr>> = (0..10)
             .map(|_| {
                 (0..log_len)
                     .map(|_| <Fr as UniformRand>::rand(&mut rng))
-                    .collect::<Vec<_>>()
+                    .collect()
             })
-            .collect::<Vec<_>>();
+            .collect();
+        let polys: Vec<_> = (0..10).map(|_| poly.clone()).collect();
+        let comms: Vec<_> = (0..10).map(|_| commit.clone()).collect();
+        let values: Vec<Fr> = points.iter().map(|p| poly.clone().eval(p)).collect();
+
         let mut random_oracle = RandomOracle::new(&mut rng);
-        let proof = Mkzg::batch_open(&pp, poly.clone(), point.clone(), &mut random_oracle);
+        let proof = Mkzg::batch_open(&pp, &polys, &points, &mut random_oracle);
 
         random_oracle.restart();
         assert!(Mkzg::batch_verify(
             &vp,
-            point.clone(),
-            &commit,
-            point.iter().map(|p| poly.clone().eval(p)).collect(),
+            &points,
+            &comms,
+            &values,
+            proof,
+            &mut random_oracle
+        ));
+    }
+
+    #[test]
+    fn test_batch_multi_poly() {
+        let mut rng = thread_rng();
+        let (pp, vp) = Mkzg::<Bn254>::gen_srs(LOG_CHUNK_SIZE, &mut rng);
+
+        let poly1 = MlPoly((0..500).map(|_| Fr::rand(&mut rng)).collect());
+        let poly2 = MlPoly((0..2000).map(|_| Fr::rand(&mut rng)).collect());
+        let poly3 = MlPoly((0..(1 << 12)).map(|_| Fr::rand(&mut rng)).collect());
+
+        let commit1 = Mkzg::commit(&pp, &poly1);
+        let commit2 = Mkzg::commit(&pp, &poly2);
+        let commit3 = Mkzg::commit(&pp, &poly3);
+
+        let point1: Vec<Fr> = (0..9).map(|_| Fr::rand(&mut rng)).collect();
+        let point2: Vec<Fr> = (0..11).map(|_| Fr::rand(&mut rng)).collect();
+        let point3: Vec<Fr> = (0..12).map(|_| Fr::rand(&mut rng)).collect();
+
+        let value1 = poly1.clone().eval(&point1);
+        let value2 = poly2.clone().eval(&point2);
+        let value3 = poly3.clone().eval(&point3);
+
+        let polys = vec![poly1, poly2, poly3];
+        let points = vec![point1, point2, point3];
+        let comms = vec![commit1, commit2, commit3];
+        let values = vec![value1, value2, value3];
+
+        let mut random_oracle = RandomOracle::new(&mut rng);
+        let proof = Mkzg::batch_open(&pp, &polys, &points, &mut random_oracle);
+
+        random_oracle.restart();
+        assert!(Mkzg::batch_verify(
+            &vp,
+            &points,
+            &comms,
+            &values,
             proof,
             &mut random_oracle
         ));
