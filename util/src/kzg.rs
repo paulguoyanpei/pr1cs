@@ -157,24 +157,11 @@ impl<E: Pairing> Mkzg<E> {
         let k = polys.len();
         assert_eq!(k, points.len());
         assert!(k > 0);
+        let chunk_size = srs.0.len();
+        let log_chunk_size = chunk_size.ilog2() as usize;
+
         let mut sumcheck_proof = vec![];
         let r = oracle.next_field();
-
-        let nv = polys
-            .iter()
-            .zip(points.iter())
-            .map(|(poly, pt)| {
-                let len = poly.0.len();
-                let poly_nv = if len <= 1 {
-                    1
-                } else {
-                    (len - 1).ilog2() as usize + 1
-                };
-                poly_nv.max(pt.len())
-            })
-            .max()
-            .unwrap();
-        let full_len = 1usize << nv;
 
         // r_powers[i] = r^{k-1-i} (Horner ordering)
         let mut r_powers = vec![E::ScalarField::one(); k];
@@ -186,23 +173,52 @@ impl<E: Pairing> Mkzg<E> {
             }
         }
 
-        // Per-polynomial eq and poly evaluations
-        let mut eq_evals: Vec<Vec<E::ScalarField>> = Vec::with_capacity(k);
-        let mut poly_evals_arr: Vec<Vec<E::ScalarField>> = Vec::with_capacity(k);
+        // For each poly, fold chunk-selector vars (point[log_chunk_size..]) so that
+        // the resulting g_i has exactly chunk_size evals and g_i(lower_i) = f_i(point_i),
+        // where lower_i = point_i[..log_chunk_size] padded with zeros to log_chunk_size.
+        let zero = E::ScalarField::zero();
+        let mut folded_polys: Vec<Vec<E::ScalarField>> = Vec::with_capacity(k);
+        let mut lower_points: Vec<Vec<E::ScalarField>> = Vec::with_capacity(k);
         for i in 0..k {
-            let mut padded_point = points[i].clone();
-            padded_point.resize(nv, E::ScalarField::zero());
-            let eq = MlPoly::new_eq(&padded_point);
-            eq_evals.push(eq.0);
+            let pt = &points[i];
+            let split = pt.len().min(log_chunk_size);
+            let mut lower = pt[..split].to_vec();
+            lower.resize(log_chunk_size, zero);
+            let upper: &[E::ScalarField] = if pt.len() > log_chunk_size {
+                &pt[log_chunk_size..]
+            } else {
+                &[]
+            };
 
-            let mut pe = polys[i].0.clone();
-            pe.resize(full_len, E::ScalarField::zero());
-            poly_evals_arr.push(pe);
+            let mut poly = polys[i].0.clone();
+            for rv in upper.iter() {
+                let num_chunks = (poly.len() + chunk_size - 1) / chunk_size;
+                let new_num = (num_chunks + 1) / 2;
+                for ii in 0..new_num {
+                    for j in 0..chunk_size {
+                        let idx0 = ii * 2 * chunk_size + j;
+                        let idx1 = (ii * 2 + 1) * chunk_size + j;
+                        let v0 = if idx0 < poly.len() { poly[idx0] } else { zero };
+                        let v1 = if idx1 < poly.len() { poly[idx1] } else { zero };
+                        poly[ii * chunk_size + j] = v0 + (v1 - v0) * (*rv);
+                    }
+                }
+                poly.truncate(new_num * chunk_size);
+            }
+            poly.resize(chunk_size, zero);
+
+            folded_polys.push(poly);
+            lower_points.push(lower);
         }
 
+        // Sumcheck state
+        let mut eq_evals: Vec<Vec<E::ScalarField>> =
+            (0..k).map(|i| MlPoly::new_eq(&lower_points[i]).0).collect();
+        let mut poly_evals_arr: Vec<Vec<E::ScalarField>> = folded_polys.iter().cloned().collect();
+
         let mut r_point = vec![];
-        for round in 0..nv {
-            let m = 1usize << (nv - round);
+        for round in 0..log_chunk_size {
+            let m = 1usize << (log_chunk_size - round);
             let sums =
                 (0..m)
                     .step_by(2)
@@ -240,14 +256,13 @@ impl<E: Pairing> Mkzg<E> {
             }
         }
 
-        // Combined polynomial H(x) = Σ_i w_i * f_i(x)
-        // where w_i = r_powers[i] * eq(z_i_padded, r_point)
-        let max_len = polys.iter().map(|p| p.0.len()).max().unwrap();
-        let mut combined = vec![E::ScalarField::zero(); max_len];
+        // Combined polynomial H(x) = Σ_i w_i * g_i(x), size = chunk_size
+        // where w_i = r_powers[i] * eq(lower_i, r_point)
+        let mut combined = vec![E::ScalarField::zero(); chunk_size];
         for i in 0..k {
             let w = r_powers[i] * eq_evals[i][0];
-            for j in 0..polys[i].0.len() {
-                combined[j] += w * polys[i].0[j];
+            for j in 0..chunk_size {
+                combined[j] += w * folded_polys[i][j];
             }
         }
 
@@ -267,7 +282,9 @@ impl<E: Pairing> Mkzg<E> {
         assert_eq!(k, comms.len());
         assert_eq!(k, values.len());
 
-        let nv = points.iter().map(|p| p.len()).max().unwrap_or(1);
+        let log_chunk_size = vp.params.len();
+        let one = E::ScalarField::one();
+        let zero = E::ScalarField::zero();
         let r = oracle.next_field();
 
         let mut y = E::ScalarField::zero();
@@ -289,7 +306,7 @@ impl<E: Pairing> Mkzg<E> {
         let (kzg_proof, sumcheck_proof) = proof;
         let one_over_two = E::ScalarField::from(2).inverse().unwrap();
         let three_over_two = one_over_two * E::ScalarField::from(3);
-        for i in 0..nv {
+        for i in 0..log_chunk_size {
             let sum = [
                 sumcheck_proof.0[i * 3],
                 sumcheck_proof.0[i * 3 + 1],
@@ -304,32 +321,45 @@ impl<E: Pairing> Mkzg<E> {
                 + challenge * challenge * (one_over_two * sum[0] - sum[1] + one_over_two * sum[2]);
         }
 
-        // weights[i] = r_powers[i] * eq(z_i_padded, r_point)
+        // weights[i] = r_powers[i] * eq(lower_i, r_point)
+        // where lower_i = points[i][..log_chunk_size] padded with zeros.
         let weights: Vec<_> = (0..k)
             .map(|i| {
-                let mut padded = points[i].clone();
-                padded.resize(nv, E::ScalarField::zero());
-                r_powers[i] * MlPoly::eval_eq(&padded, &r_point)
+                let split = points[i].len().min(log_chunk_size);
+                let mut lower = points[i][..split].to_vec();
+                lower.resize(log_chunk_size, zero);
+                r_powers[i] * MlPoly::eval_eq(&lower, &r_point)
             })
             .collect();
 
-        // Combined commitment: for each chunk, Σ_i w_i * comm_i[chunk]
-        let max_chunks = comms.iter().map(|c| c.0.len()).max().unwrap_or(0);
-        let combined_commit = MkzgCommit(
-            (0..max_chunks)
-                .map(|chunk_idx| {
-                    let mut sum: E::G1 = Zero::zero();
-                    for i in 0..k {
-                        if chunk_idx < comms[i].0.len() {
-                            sum += comms[i].0[chunk_idx] * weights[i];
-                        }
+        // For each poly, fold comm_i by upper_i (chunk-selector) to a single G1,
+        // then combine with weights[i] into a single-chunk commitment.
+        let mut combined: E::G1 = Zero::zero();
+        for i in 0..k {
+            let upper: &[E::ScalarField] = if points[i].len() > log_chunk_size {
+                &points[i][log_chunk_size..]
+            } else {
+                &[]
+            };
+            let mut cs = comms[i].0.clone();
+            for rv in upper.iter() {
+                let cur_len = cs.len();
+                let new_len = (cur_len + 1) / 2;
+                for ii in 0..new_len {
+                    if ii * 2 + 1 < cur_len {
+                        cs[ii] = cs[ii * 2] + (cs[ii * 2 + 1] - cs[ii * 2]) * (*rv);
+                    } else {
+                        cs[ii] = cs[ii * 2] * (one - *rv);
                     }
-                    sum
-                })
-                .collect(),
-        );
+                }
+                cs.truncate(new_len);
+            }
+            if !cs.is_empty() {
+                combined += cs[0] * weights[i];
+            }
+        }
 
-        Self::verify(vp, r_point, &combined_commit, y, kzg_proof)
+        Self::verify(vp, r_point, &MkzgCommit(vec![combined]), y, kzg_proof)
     }
 
     pub fn verify(
