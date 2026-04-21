@@ -10,8 +10,8 @@ pub struct Mkzg<E: Pairing>(PhantomData<E>);
 #[derive(Debug, Clone)]
 pub struct MkzgCommit<E: Pairing>(pub Vec<E::G1>);
 #[derive(Debug, Clone)]
-pub struct MkzgProof<E: Pairing>(Vec<E::G1>);
-pub struct SumcheckProof<F: Field>(Vec<F>);
+pub struct MkzgProof<E: Pairing>(pub Vec<E::G1>);
+pub struct SumcheckProof<F: Field>(pub Vec<F>);
 #[derive(Debug, Clone)]
 pub struct MkzgVerParams<E: Pairing> {
     pub g: E::G1,

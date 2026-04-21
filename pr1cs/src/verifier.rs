@@ -1,7 +1,7 @@
 use ark_ec::pairing::Pairing;
 use ark_ff::{Field, PrimeField, Zero};
 use util::{
-    kzg::MkzgVerParams,
+    kzg::{Mkzg, MkzgCommit, MkzgProof, MkzgVerParams, SumcheckProof},
     poly::MlPoly,
     util::{batch_inverse, Proof, RandomOracle},
 };
@@ -11,15 +11,19 @@ use crate::circuit::Circuit;
 pub struct Verifier<E: Pairing> {
     kzg_vp: MkzgVerParams<E>,
     circuit: Circuit<E::ScalarField>,
-    weight_len: usize,
+    weights: Vec<E::ScalarField>,
 }
 
 impl<E: Pairing> Verifier<E> {
-    pub fn new(vp: MkzgVerParams<E>, circuit: Circuit<E::ScalarField>, weight_len: usize) -> Self {
+    pub fn new(
+        vp: MkzgVerParams<E>,
+        circuit: Circuit<E::ScalarField>,
+        weights: Vec<E::ScalarField>,
+    ) -> Self {
         Verifier {
             kzg_vp: vp,
             circuit,
-            weight_len,
+            weights,
         }
     }
 
@@ -85,6 +89,11 @@ impl<E: Pairing> Verifier<E> {
         ro: &mut RandomOracle<E::ScalarField>,
     ) {
         ro.restart();
+
+        // Read z_suf commitment.
+        let z_suf_commit_len = proof.next_u();
+        let z_suf_commit = MkzgCommit(proof.next_n_gs(z_suf_commit_len));
+
         let len = proof.next_u();
         let nv = (len - 1).ilog2() as usize + 1;
         let r = ro.next_n_fields(nv);
@@ -98,6 +107,15 @@ impl<E: Pairing> Verifier<E> {
 
         let r_lut = ro.next_field();
         let alpha = ro.next_field();
+
+        // Read count, ele_inv, tab_inv commitments.
+        let count_commit_len = proof.next_u();
+        let count_commit = MkzgCommit(proof.next_n_gs(count_commit_len));
+        let ele_inv_commit_len = proof.next_u();
+        let ele_inv_commit = MkzgCommit(proof.next_n_gs(ele_inv_commit_len));
+        let tab_inv_commit_len = proof.next_u();
+        let tab_inv_commit = MkzgCommit(proof.next_n_gs(tab_inv_commit_len));
+
         let sum = proof.next_f();
         let len = proof.next_u();
         let nv = (len - 1).ilog2() as usize + 1;
@@ -122,6 +140,12 @@ impl<E: Pairing> Verifier<E> {
                 .reduce(|acc, v| acc * r_lut + v)
                 .unwrap() + alpha
         );
+        // logup_values[2] is the claimed tp(point_logup_left); tp is public.
+        assert_eq!(
+            logup_values[2],
+            MlPoly::new(self.circuit.tp.clone()).eval(&point_logup_left)
+        );
+
         let len = proof.next_u();
         let nv = (len - 1).ilog2() as usize + 1;
         let r = ro.next_n_fields(nv);
@@ -136,6 +160,15 @@ impl<E: Pairing> Verifier<E> {
                 * MlPoly::eval_eq_pref(&r, &point_logup_right, len)
                 + r_sum * tab_inv * count
         );
+        // tab is public: tab[i] = table[i].0 + table[i].1 * r_lut + table[i].2 * r_lut^2,
+        // with `alpha` added inside logup_sumcheck_right before the sumcheck.
+        let tab_vec: Vec<E::ScalarField> = self
+            .circuit
+            .table
+            .iter()
+            .map(|&(i, j, k)| ((k * r_lut) + j) * r_lut + i + alpha)
+            .collect();
+        assert_eq!(tab, MlPoly::new(tab_vec).eval(&point_logup_right));
 
         let suf_values = proof.next_n_fs(5);
         let r_suf = ro.next_field();
@@ -154,6 +187,46 @@ impl<E: Pairing> Verifier<E> {
         let suf_m = proof.next_f();
         let suf_z = proof.next_f();
         assert_eq!(y, suf_m * suf_z);
+
+        // Verify suf_m against the sparse-matrix MLEs over the suffix column window.
+        // Rows of A, B, C are reduced against eq(point1); D, E against eq(point_logup_left).
+        let wei_len = self.circuit.weight_len;
+        let row_eq_1 = MlPoly::new_eq(&point1).0;
+        let row_eq_lu = MlPoly::new_eq(&point_logup_left).0;
+        let col_eq_suf = MlPoly::new_eq(&point_suf).0;
+        let a_suf_eval =
+            self.circuit
+                .a
+                .mle(&row_eq_1, &col_eq_suf, wei_len, usize::MAX, gamma);
+        let b_suf_eval =
+            self.circuit
+                .b
+                .mle(&row_eq_1, &col_eq_suf, wei_len, usize::MAX, gamma);
+        let c_suf_eval =
+            self.circuit
+                .c
+                .mle(&row_eq_1, &col_eq_suf, wei_len, usize::MAX, gamma);
+        let d_suf_eval =
+            self.circuit
+                .d
+                .mle(&row_eq_lu, &col_eq_suf, wei_len, usize::MAX, gamma);
+        let e_suf_eval =
+            self.circuit
+                .e
+                .mle(&row_eq_lu, &col_eq_suf, wei_len, usize::MAX, gamma);
+        let suf_m_expected = [
+            a_suf_eval,
+            b_suf_eval,
+            c_suf_eval,
+            d_suf_eval,
+            e_suf_eval,
+        ]
+        .iter()
+        .rev()
+        .copied()
+        .reduce(|acc, v| acc * r_suf + v)
+        .unwrap();
+        assert_eq!(suf_m, suf_m_expected);
 
         let pre_values = proof.next_n_fs(5);
         let r_pre = ro.next_field();
@@ -177,5 +250,52 @@ impl<E: Pairing> Verifier<E> {
         let pre_m = proof.next_f();
         let pre_z = proof.next_f();
         assert_eq!(y, pre_m * pre_z);
+
+        // Verify pre_m against the sparse-matrix MLEs over the prefix column window.
+        let col_eq_pre = MlPoly::new_eq(&point_pre).0;
+        let a_pre_eval = self.circuit.a.mle(&row_eq_1, &col_eq_pre, 0, wei_len, gamma);
+        let b_pre_eval = self.circuit.b.mle(&row_eq_1, &col_eq_pre, 0, wei_len, gamma);
+        let c_pre_eval = self.circuit.c.mle(&row_eq_1, &col_eq_pre, 0, wei_len, gamma);
+        let d_pre_eval = self.circuit.d.mle(&row_eq_lu, &col_eq_pre, 0, wei_len, gamma);
+        let e_pre_eval = self.circuit.e.mle(&row_eq_lu, &col_eq_pre, 0, wei_len, gamma);
+        let pre_m_expected = [
+            a_pre_eval,
+            b_pre_eval,
+            c_pre_eval,
+            d_pre_eval,
+            e_pre_eval,
+        ]
+        .iter()
+        .rev()
+        .copied()
+        .reduce(|acc, v| acc * r_pre + v)
+        .unwrap();
+        assert_eq!(pre_m, pre_m_expected);
+
+        // pre_z = weights(point_pre); weights are public.
+        assert_eq!(pre_z, MlPoly::new(self.weights.clone()).eval(&point_pre));
+
+        // Batch-verify the four PCS openings.
+        let kzg_proof_len = proof.next_u();
+        let kzg_proof = MkzgProof(proof.next_n_gs(kzg_proof_len));
+        let sumcheck_proof_len = proof.next_u();
+        let sumcheck_proof = SumcheckProof(proof.next_n_fs(sumcheck_proof_len));
+
+        let points = vec![
+            point_suf,
+            point_logup_right.clone(),
+            point_logup_left,
+            point_logup_right,
+        ];
+        let comms = vec![z_suf_commit, count_commit, ele_inv_commit, tab_inv_commit];
+        let values = vec![suf_z, count, ele_inv, tab_inv];
+        assert!(Mkzg::batch_verify(
+            &self.kzg_vp,
+            &points,
+            &comms,
+            &values,
+            (kzg_proof, sumcheck_proof),
+            ro,
+        ));
     }
 }

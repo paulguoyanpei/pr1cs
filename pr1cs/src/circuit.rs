@@ -84,6 +84,35 @@ impl<F: PrimeField> SparseMatrix<F> {
         }
         res
     }
+
+    // Evaluates MLE of the sparse matrix restricted to column window
+    // [col_offset, col_limit), at (row_point, col_point), with row_eq and
+    // col_eq being the full eq-vectors for those points. Returns
+    //   sum_{(cr, col, val, pow) in entries, col_offset <= col < col_limit}
+    //       row_eq[cr] * col_eq[col - col_offset] * val * gamma^pow
+    pub fn mle(
+        &self,
+        row_eq: &[F],
+        col_eq: &[F],
+        col_offset: usize,
+        col_limit: usize,
+        gamma: F,
+    ) -> F {
+        let mut result = F::ZERO;
+        for cr in 0..self.rows.len() {
+            let re = row_eq[cr];
+            for (col, val, pow) in self.rows[cr].elems.iter() {
+                if *col >= col_offset && *col < col_limit {
+                    let p = match *pow {
+                        Some(p) => gamma.pow([p as u64]),
+                        None => F::ONE,
+                    };
+                    result += re * col_eq[col - col_offset] * *val * p;
+                }
+            }
+        }
+        result
+    }
 }
 
 #[derive(Debug, Clone)]

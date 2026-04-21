@@ -33,6 +33,16 @@ impl<E: Pairing> Proof<E> {
         }
     }
 
+    pub fn push_g(&mut self, g: E::G1) {
+        self.g.push(g);
+    }
+
+    pub fn push_gs(&mut self, gs: &[E::G1]) {
+        for i in gs {
+            self.g.push(*i);
+        }
+    }
+
     pub fn next_f(&mut self) -> E::ScalarField {
         let ret = self.f[self.f_idx];
         self.f_idx += 1;
@@ -48,6 +58,18 @@ impl<E: Pairing> Proof<E> {
     pub fn next_u(&mut self) -> usize {
         let ret = self.u[self.u_idx];
         self.u_idx += 1;
+        ret
+    }
+
+    pub fn next_g(&mut self) -> E::G1 {
+        let ret = self.g[self.g_idx];
+        self.g_idx += 1;
+        ret
+    }
+
+    pub fn next_n_gs(&mut self, n: usize) -> Vec<E::G1> {
+        let ret = self.g[self.g_idx..self.g_idx + n].to_vec();
+        self.g_idx += n;
         ret
     }
 }

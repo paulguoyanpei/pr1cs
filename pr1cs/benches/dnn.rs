@@ -95,7 +95,8 @@ fn main() {
     let prover = Prover::new(kzg_pp, circuit.clone());
     let mut ro = RandomOracle::new(&mut rng);
     let proof = prover.prove(z, gamma, &mut ro);
-    let verifier = Verifier::new(kzg_vp, circuit, weight_len);
+    let verifier = Verifier::new(kzg_vp, circuit, program.weights());
+    let _ = weight_len;
     verifier.verify(proof, gamma, &mut ro);
     println!("finish DNN!")
 }

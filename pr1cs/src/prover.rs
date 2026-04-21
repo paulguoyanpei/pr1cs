@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ark_ec::pairing::Pairing;
 use ark_ff::{AdditiveGroup, One, PrimeField, Zero};
 use util::{
-    kzg::MkzgProveParams,
+    kzg::{Mkzg, MkzgProveParams},
     poly::MlPoly,
     util::{batch_inverse, Proof, RandomOracle},
 };
@@ -279,6 +279,14 @@ impl<E: Pairing> Prover<E> {
         ro: &mut RandomOracle<E::ScalarField>,
     ) -> Proof<E> {
         let mut proof = Proof::new();
+        let wei_len = self.circuit.weight_len;
+
+        // Commit z_suf up-front (witness, independent of any challenge).
+        let z_suf_poly = MlPoly::new(z[wei_len..].to_vec());
+        let z_suf_commit = Mkzg::<E>::commit(&self.kzg_pp, &z_suf_poly);
+        proof.push_u(z_suf_commit.0.len());
+        proof.push_gs(&z_suf_commit.0);
+
         let cons_line = self.circuit.a.len();
         let lu_line = self.circuit.d.len();
         let mut a = vec![];
@@ -314,6 +322,21 @@ impl<E: Pairing> Prover<E> {
         batch_inverse(&mut ele_inv);
         let mut tab_inv = tab.iter().map(|&x| x + alpha).collect::<Vec<_>>();
         batch_inverse(&mut tab_inv);
+
+        // Commit count, ele_inv, tab_inv (depend on challenges r, alpha).
+        let count_poly = MlPoly::new(count.clone());
+        let count_commit = Mkzg::<E>::commit(&self.kzg_pp, &count_poly);
+        proof.push_u(count_commit.0.len());
+        proof.push_gs(&count_commit.0);
+        let ele_inv_poly = MlPoly::new(ele_inv.clone());
+        let ele_inv_commit = Mkzg::<E>::commit(&self.kzg_pp, &ele_inv_poly);
+        proof.push_u(ele_inv_commit.0.len());
+        proof.push_gs(&ele_inv_commit.0);
+        let tab_inv_poly = MlPoly::new(tab_inv.clone());
+        let tab_inv_commit = Mkzg::<E>::commit(&self.kzg_pp, &tab_inv_poly);
+        proof.push_u(tab_inv_commit.0.len());
+        proof.push_gs(&tab_inv_commit.0);
+
         let sum: E::ScalarField = ele_inv.iter().sum();
         proof.push_f(&[sum]);
         let point_logup_left = Self::logup_sumcheck_left(ele, ele_inv, alpha, &mut proof, ro);
@@ -333,7 +356,6 @@ impl<E: Pairing> Prover<E> {
         let d = self.circuit.d.vec_mult(&eq_v, z.len(), gamma);
         let e = self.circuit.e.vec_mult(&eq_v, z.len(), gamma);
 
-        let wei_len = self.circuit.weight_len;
         let a_suf = a[wei_len..].to_vec();
         let b_suf = b[wei_len..].to_vec();
         let c_suf = c[wei_len..].to_vec();
@@ -399,7 +421,21 @@ impl<E: Pairing> Prover<E> {
             m_pre[i] += a_pre[i];
         }
 
-        let point3 = Self::sumcheck_2(m_pre, z_pre, &mut proof, ro);
+        let _point3 = Self::sumcheck_2(m_pre, z_pre, &mut proof, ro);
+
+        // Batch-open the four committed polynomials at their respective points.
+        let polys = vec![z_suf_poly, count_poly, ele_inv_poly, tab_inv_poly];
+        let points = vec![
+            point2,
+            point_logup_right.clone(),
+            point_logup_left,
+            point_logup_right,
+        ];
+        let (kzg_proof, sumcheck_proof) = Mkzg::<E>::batch_open(&self.kzg_pp, &polys, &points, ro);
+        proof.push_u(kzg_proof.0.len());
+        proof.push_gs(&kzg_proof.0);
+        proof.push_u(sumcheck_proof.0.len());
+        proof.push_f(&sumcheck_proof.0);
 
         proof
     }
