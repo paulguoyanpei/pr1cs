@@ -69,17 +69,39 @@ impl<F: PrimeField> SparseMatrix<F> {
         return self.rows[idx].mult_vec(z, gamma);
     }
 
-    pub fn vec_mult(&self, v: &Vec<F>, col_num: usize, gamma: F) -> Vec<F> {
+    pub fn vec_mult_suf(&self, v: &Vec<F>, col_num: usize, pos: usize, gamma: F) -> Vec<F> {
         assert!(v.len() >= self.rows.len());
         let mut res = Vec::new();
-        res.resize(col_num, F::ZERO);
+        res.resize(col_num - pos, F::ZERO);
         for i in 0..(self.rows.len()) {
-            for (idx, val, pow) in self.rows[i].elems.iter() {
-                let p = match *pow {
+            for &(idx, val, pow) in self.rows[i].elems.iter() {
+                if idx < pos {
+                    continue;
+                }
+                let p = match pow {
                     Some(p) => gamma.pow([p as u64]),
                     None => F::ONE,
                 };
-                res[*idx] += v[i] * val.clone() * p;
+                res[idx - pos] += v[i] * val.clone() * p;
+            }
+        }
+        res
+    }
+
+    pub fn vec_mult_pre(&self, v: &Vec<F>, pos: usize, gamma: F) -> Vec<F> {
+        assert!(v.len() >= self.rows.len());
+        let mut res = Vec::new();
+        res.resize(pos, F::ZERO);
+        for i in 0..(self.rows.len()) {
+            for &(idx, val, pow) in self.rows[i].elems.iter() {
+                if idx >= pos {
+                    continue;
+                }
+                let p = match pow {
+                    Some(p) => gamma.pow([p as u64]),
+                    None => F::ONE,
+                };
+                res[idx] += v[i] * val.clone() * p;
             }
         }
         res

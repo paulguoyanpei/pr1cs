@@ -11,6 +11,7 @@ use crate::{circuit::Circuit, sparse};
 pub struct DensePublicPolys<F: PrimeField> {
     pub weights: MlPoly<F>,
     pub tp: MlPoly<F>,
+    pub tp_one: MlPoly<F>,
     pub table_i: MlPoly<F>,
     pub table_j: MlPoly<F>,
     pub table_k: MlPoly<F>,
@@ -30,6 +31,7 @@ pub struct VerifierKey<E: Pairing> {
     pub weight_len: usize,
     pub weights_commit: MkzgCommit<E>,
     pub tp_commit: MkzgCommit<E>,
+    pub tp_one_commit: MkzgCommit<E>,
     pub table_i_commit: MkzgCommit<E>,
     pub table_j_commit: MkzgCommit<E>,
     pub table_k_commit: MkzgCommit<E>,
@@ -49,6 +51,7 @@ impl Preprocessor {
         let dense_public_polys = DensePublicPolys {
             weights: MlPoly::new(circuit.weights.clone()),
             tp: MlPoly::new(circuit.tp.clone()),
+            tp_one: MlPoly::new(vec![E::ScalarField::ONE; circuit.tp.len()]),
             table_i: MlPoly::new(circuit.table.iter().map(|&(i, _, _)| i).collect()),
             table_j: MlPoly::new(circuit.table.iter().map(|&(_, j, _)| j).collect()),
             table_k: MlPoly::new(circuit.table.iter().map(|&(_, _, k)| k).collect()),
@@ -60,6 +63,7 @@ impl Preprocessor {
             weight_len: circuit.weight_len,
             weights_commit: Mkzg::<E>::commit(&kzg_pp, &dense_public_polys.weights),
             tp_commit: Mkzg::<E>::commit(&kzg_pp, &dense_public_polys.tp),
+            tp_one_commit: Mkzg::<E>::commit(&kzg_pp, &dense_public_polys.tp_one),
             table_i_commit: Mkzg::<E>::commit(&kzg_pp, &dense_public_polys.table_i),
             table_j_commit: Mkzg::<E>::commit(&kzg_pp, &dense_public_polys.table_j),
             table_k_commit: Mkzg::<E>::commit(&kzg_pp, &dense_public_polys.table_k),

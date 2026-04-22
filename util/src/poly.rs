@@ -1,5 +1,4 @@
-use ark_ff::{FftField, Field, One};
-use ark_serialize::CanonicalSerialize;
+use ark_ff::Field;
 
 #[derive(Debug, Clone)]
 pub struct MlPoly<F: Field>(pub Vec<F>);

@@ -125,15 +125,6 @@ impl<E: Pairing> Verifier<E> {
                 + r_sum * ele_inv
         );
         let logup_values = proof.next_n_fs(3);
-        assert_eq!(
-            ele,
-            logup_values
-                .iter()
-                .rev()
-                .copied()
-                .reduce(|acc, v| acc * r_lut + v)
-                .unwrap() + alpha
-        );
         let len = proof.next_u();
         let nv = (len - 1).ilog2() as usize + 1;
         let r = ro.next_n_fields(nv);
@@ -233,12 +224,23 @@ impl<E: Pairing> Verifier<E> {
 
         let weights = proof.next_f();
         let tp = proof.next_f();
+        let tp_one = proof.next_f();
         let table_i = proof.next_f();
         let table_j = proof.next_f();
         let table_k = proof.next_f();
         let table_one = proof.next_f();
         assert_eq!(pre_z, weights);
         assert_eq!(logup_values[2], tp);
+        assert_eq!(
+            ele,
+            logup_values
+                .iter()
+                .rev()
+                .copied()
+                .reduce(|acc, v| acc * r_lut + v)
+                .unwrap()
+                + alpha * tp_one
+        );
         assert_eq!(tab, ((table_k * r_lut) + table_j) * r_lut + table_i + alpha * table_one);
 
         // Batch-verify witness-dependent and preprocessed dense PCS openings.
@@ -253,6 +255,7 @@ impl<E: Pairing> Verifier<E> {
             point_logup_left.clone(),
             point_logup_right.clone(),
             point_pre,
+            point_logup_left.clone(),
             point_logup_left,
             point_logup_right.clone(),
             point_logup_right.clone(),
@@ -266,13 +269,15 @@ impl<E: Pairing> Verifier<E> {
             tab_inv_commit,
             self.vk.weights_commit.clone(),
             self.vk.tp_commit.clone(),
+            self.vk.tp_one_commit.clone(),
             self.vk.table_i_commit.clone(),
             self.vk.table_j_commit.clone(),
             self.vk.table_k_commit.clone(),
             self.vk.table_one_commit.clone(),
         ];
         let values = vec![
-            suf_z, count, ele_inv, tab_inv, weights, tp, table_i, table_j, table_k, table_one,
+            suf_z, count, ele_inv, tab_inv, weights, tp, tp_one, table_i, table_j, table_k,
+            table_one,
         ];
         assert!(Mkzg::batch_verify(
             &self.vk.kzg_vp,

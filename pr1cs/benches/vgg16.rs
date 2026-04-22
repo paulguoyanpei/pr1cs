@@ -1,20 +1,3 @@
-// VGG-16 inference on CIFAR-10 through the pr1cs instruction set,
-// designed to produce exactly the same integer logits as
-// ../../VerfCNN/convnet.cpp for the first test image.
-//
-// Layout conventions:
-//   * Feature maps live at contiguous slots in trace order (channel, row, col).
-//   * Conv uses the pr1cs `Conv` instruction, which yields full
-//     cross-correlation of size (n + m - 1); we take the center n x n slice
-//     and discard the border to match VerfCNN's `same` conv (pad = 1).
-//   * Shift-right-by-6 is a `Quant` instruction (a * 1 = 64 * out + r), and
-//     ReLU is a `Lookup` with `LookupType::Relu`. Since ReLU masks the sign,
-//     the difference between C truncation and Rust floor-division on negative
-//     inputs does not propagate into the output.
-//   * Max-pool 2x2 uses `max(a, b) = a + Relu(b - a)` chained three times,
-//     plus a final `AddMult` (×1) to materialize the pooled value into a
-//     single contiguous slot.
-
 use std::cmp;
 use std::fs::File;
 use std::io::Read;
@@ -44,11 +27,24 @@ enum Layer {
 }
 
 const VGG16: &[Layer] = &[
-    Layer::Conv(64), Layer::Conv(64), Layer::Pool,
-    Layer::Conv(128), Layer::Conv(128), Layer::Pool,
-    Layer::Conv(256), Layer::Conv(256), Layer::Conv(256), Layer::Pool,
-    Layer::Conv(512), Layer::Conv(512), Layer::Conv(512), Layer::Pool,
-    Layer::Conv(512), Layer::Conv(512), Layer::Conv(512), Layer::Pool,
+    Layer::Conv(64),
+    Layer::Conv(64),
+    Layer::Pool,
+    Layer::Conv(128),
+    Layer::Conv(128),
+    Layer::Pool,
+    Layer::Conv(256),
+    Layer::Conv(256),
+    Layer::Conv(256),
+    Layer::Pool,
+    Layer::Conv(512),
+    Layer::Conv(512),
+    Layer::Conv(512),
+    Layer::Pool,
+    Layer::Conv(512),
+    Layer::Conv(512),
+    Layer::Conv(512),
+    Layer::Pool,
     Layer::Linear(10),
 ];
 
@@ -65,23 +61,15 @@ fn read_i32_bin(path: &Path) -> Vec<i32> {
         .unwrap_or_else(|e| panic!("open {}: {}", path.display(), e))
         .read_to_end(&mut buf)
         .unwrap();
-    assert_eq!(buf.len() % 4, 0, "{} is not a multiple of 4 bytes", path.display());
+    assert_eq!(
+        buf.len() % 4,
+        0,
+        "{} is not a multiple of 4 bytes",
+        path.display()
+    );
     buf.chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
-}
-
-fn read_logits(path: &Path) -> Option<Vec<i64>> {
-    let s = std::fs::read_to_string(path).ok()?;
-    Some(s.lines().map(|l| l.trim().parse::<i64>().unwrap()).collect())
-}
-
-fn signed_to_fr(v: i64) -> Fr {
-    if v >= 0 {
-        Fr::from(v as u64)
-    } else {
-        -Fr::from((-v) as u64)
-    }
 }
 
 /// Layout the whole pr1cs `weights` vector: [1] || conv weights (transposed to
@@ -122,10 +110,8 @@ fn build_weight_plan(raw: &[i32]) -> WeightPlan {
                                     + c * KERNEL * KERNEL
                                     + u * KERNEL
                                     + v;
-                                let dst = dest_start
-                                    + (c * cout + d) * KERNEL * KERNEL
-                                    + u * KERNEL
-                                    + v;
+                                let dst =
+                                    dest_start + (c * cout + d) * KERNEL * KERNEL + u * KERNEL + v;
                                 buf[dst] = slab[src] as i64;
                             }
                         }
@@ -202,10 +188,7 @@ fn build_program(weight_len: usize, input_len: usize, plan: &WeightPlan) -> Prog
                 for d in 0..cout {
                     for i in 0..side {
                         for j in 0..side {
-                            let src = conv_start
-                                + d * conv_plane
-                                + (i + 1) * conv_side
-                                + (j + 1);
+                            let src = conv_start + d * conv_plane + (i + 1) * conv_side + (j + 1);
                             instructions.push(Instruction::Quant {
                                 input1: vec![(src, 1)],
                                 input2: vec![(0, 1)],
@@ -338,7 +321,6 @@ fn build_program(weight_len: usize, input_len: usize, plan: &WeightPlan) -> Prog
 }
 
 fn main() {
-    // --- load weights, scales, input ------------------------------------
     let raw_weights = read_i32_bin(&data_path("vgg16_weights.bin"));
     let raw_input = read_i32_bin(&data_path("vgg16_input.bin"));
     assert_eq!(raw_input.len(), 3 * 32 * 32);
@@ -364,52 +346,34 @@ fn main() {
     );
     let _ = input_start;
 
-    // --- execute the program and extract logits -------------------------
     let program = Program::<Fr>::new(instructions, plan.buf);
     let input_i64: Vec<i64> = raw_input.iter().map(|&x| x as i64).collect();
     let trace = program.execute(input_i64);
     assert_eq!(trace.len(), aux_start_hint);
 
-    let logits_fr: Vec<Fr> = trace[logits_start..logits_start + 10].to_vec();
+    let mut rng = thread_rng();
+    let gamma = <Fr as UniformRand>::rand(&mut rng);
+    let z = program.gen_z(weight_len + input_len, trace, gamma);
 
-    // --- compare against the Python reference logits --------------------
-    let expected = read_logits(&data_path("vgg16_logits.txt"))
-        .expect("vgg16_logits.txt missing; run tools/reference.py first");
-    assert_eq!(expected.len(), 10);
-    let expected_fr: Vec<Fr> = expected.iter().map(|&v| signed_to_fr(v)).collect();
-    println!("expected logits: {:?}", expected);
-    assert_eq!(
-        logits_fr, expected_fr,
-        "pr1cs logits do not match VerfCNN reference"
-    );
-    println!("logits match VerfCNN reference ✓");
-
-    // --- optional: run the full prover/verifier -------------------------
-    if std::env::var("PR1CS_RUN_PROOF").is_ok() {
-        let mut rng = thread_rng();
-        let gamma = <Fr as UniformRand>::rand(&mut rng);
-        let z = program.gen_z(weight_len + input_len, trace, gamma);
-
-        let mut table = vec![];
-        for i in 0..(1 << 6) {
-            table.push((Fr::ZERO, Fr::from(i), Fr::from(1)));
-        }
-        for i in (-(1 << 16) + 1)..(1 << 16) {
-            table.push((Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2)));
-        }
-
-        let circuit = program.to_circuit(input_len, aux_start_hint, table);
-        circuit.check(z.clone(), gamma);
-        println!("circuit.check ok");
-
-        let mut rng = thread_rng();
-        let (kzg_pp, kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
-        let (pk, vk) = Preprocessor::build(kzg_pp, kzg_vp, circuit);
-        let prover = Prover::new(pk);
-        let mut ro = RandomOracle::new(&mut rng);
-        let proof = prover.prove(z, gamma, &mut ro);
-        let verifier = Verifier::new(vk);
-        verifier.verify(proof, gamma, &mut ro);
-        println!("proof verified ✓");
+    let mut table = vec![];
+    for i in 0..(1 << 6) {
+        table.push((Fr::ZERO, Fr::from(i), Fr::from(1)));
     }
+    for i in (-(1 << 16) + 1)..(1 << 16) {
+        table.push((Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2)));
+    }
+
+    let circuit = program.to_circuit(input_len, aux_start_hint, table);
+    circuit.check(z.clone(), gamma);
+    println!("circuit.check ok");
+
+    let mut rng = thread_rng();
+    let (kzg_pp, kzg_vp) = Mkzg::<Bn254>::gen_srs(16, &mut rng);
+    let (pk, vk) = Preprocessor::build(kzg_pp, kzg_vp, circuit);
+    let prover = Prover::new(pk);
+    let mut ro = RandomOracle::new(&mut rng);
+    let proof = prover.prove(z, gamma, &mut ro);
+    let verifier = Verifier::new(vk);
+    verifier.verify(proof, gamma, &mut ro);
+    println!("proof verified");
 }

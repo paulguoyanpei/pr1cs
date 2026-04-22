@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use ark_ec::pairing::Pairing;
 use ark_ff::{AdditiveGroup, One, Zero};
@@ -274,6 +274,7 @@ impl<E: Pairing> Prover<E> {
         gamma: E::ScalarField,
         ro: &mut RandomOracle<E::ScalarField>,
     ) -> Proof<E> {
+        let start = Instant::now();
         let mut proof = Proof::new();
         let circuit = &self.pk.circuit;
         let wei_len = circuit.weight_len;
@@ -333,7 +334,6 @@ impl<E: Pairing> Prover<E> {
         let tab_inv_commit = Mkzg::<E>::commit(&self.pk.kzg_pp, &tab_inv_poly);
         proof.push_u(tab_inv_commit.0.len());
         proof.push_gs(&tab_inv_commit.0);
-
         let sum: E::ScalarField = ele_inv.iter().sum();
         proof.push_f(&[sum]);
         let point_logup_left = Self::logup_sumcheck_left(ele, ele_inv, alpha, &mut proof, ro);
@@ -345,19 +345,13 @@ impl<E: Pairing> Prover<E> {
         let point_logup_right =
             Self::logup_sumcheck_right(tab, tab_inv, count, alpha, &mut proof, ro);
 
-        let eq_v = MlPoly::new_eq(&point1).0;
-        let a = circuit.a.vec_mult(&eq_v, z.len(), gamma);
-        let b = circuit.b.vec_mult(&eq_v, z.len(), gamma);
-        let c = circuit.c.vec_mult(&eq_v, z.len(), gamma);
-        let eq_v = MlPoly::new_eq(&point_logup_left).0;
-        let d = circuit.d.vec_mult(&eq_v, z.len(), gamma);
-        let e = circuit.e.vec_mult(&eq_v, z.len(), gamma);
-
-        let a_suf = a[wei_len..].to_vec();
-        let b_suf = b[wei_len..].to_vec();
-        let c_suf = c[wei_len..].to_vec();
-        let d_suf = d[wei_len..].to_vec();
-        let e_suf = e[wei_len..].to_vec();
+        let eq_sc1 = MlPoly::new_eq(&point1).0;
+        let eq_lu = MlPoly::new_eq(&point_logup_left).0;
+        let a_suf = circuit.a.vec_mult_suf(&eq_sc1, z.len(), wei_len, gamma);
+        let b_suf = circuit.b.vec_mult_suf(&eq_sc1, z.len(), wei_len, gamma);
+        let c_suf = circuit.c.vec_mult_suf(&eq_sc1, z.len(), wei_len, gamma);
+        let d_suf = circuit.d.vec_mult_suf(&eq_lu, z.len(), wei_len, gamma);
+        let e_suf = circuit.e.vec_mult_suf(&eq_lu, z.len(), wei_len, gamma);
         let z_suf = z[wei_len..].to_vec();
         let mut m_suf = e_suf.clone();
         let mut a_suf_sum = E::ScalarField::zero();
@@ -386,11 +380,12 @@ impl<E: Pairing> Prover<E> {
         }
         let point2 = Self::sumcheck_2(m_suf, z_suf, &mut proof, ro);
 
-        let a_pre = a[..wei_len].to_vec();
-        let b_pre = b[..wei_len].to_vec();
-        let c_pre = c[..wei_len].to_vec();
-        let d_pre = d[..wei_len].to_vec();
-        let e_pre = e[..wei_len].to_vec();
+        println!("{}", start.elapsed().as_millis());
+        let a_pre = circuit.a.vec_mult_pre(&eq_sc1, wei_len, gamma);
+        let b_pre = circuit.b.vec_mult_pre(&eq_sc1, wei_len, gamma);
+        let c_pre = circuit.c.vec_mult_pre(&eq_sc1, wei_len, gamma);
+        let d_pre = circuit.d.vec_mult_pre(&eq_lu, wei_len, gamma);
+        let e_pre = circuit.e.vec_mult_pre(&eq_lu, wei_len, gamma);
         let z_pre = z[..wei_len].to_vec();
         let mut m_pre = e_pre.clone();
         let mut a_pre_sum = E::ScalarField::zero();
@@ -420,14 +415,8 @@ impl<E: Pairing> Prover<E> {
 
         let point3 = Self::sumcheck_2(m_pre, z_pre, &mut proof, ro);
 
-        let sparse_evals = sparse::sparse_open(
-            circuit,
-            &point1,
-            &point_logup_left,
-            &point2,
-            &point3,
-            gamma,
-        );
+        let sparse_evals =
+            sparse::sparse_open(circuit, &point1, &point_logup_left, &point2, &point3, gamma);
         proof.push_f(&[
             sparse_evals.a_suf,
             sparse_evals.b_suf,
@@ -442,10 +431,31 @@ impl<E: Pairing> Prover<E> {
         ]);
         proof.push_f(&[
             self.pk.dense_public_polys.weights.clone().eval(&point3),
-            self.pk.dense_public_polys.tp.clone().eval(&point_logup_left),
-            self.pk.dense_public_polys.table_i.clone().eval(&point_logup_right),
-            self.pk.dense_public_polys.table_j.clone().eval(&point_logup_right),
-            self.pk.dense_public_polys.table_k.clone().eval(&point_logup_right),
+            self.pk
+                .dense_public_polys
+                .tp
+                .clone()
+                .eval(&point_logup_left),
+            self.pk
+                .dense_public_polys
+                .tp_one
+                .clone()
+                .eval(&point_logup_left),
+            self.pk
+                .dense_public_polys
+                .table_i
+                .clone()
+                .eval(&point_logup_right),
+            self.pk
+                .dense_public_polys
+                .table_j
+                .clone()
+                .eval(&point_logup_right),
+            self.pk
+                .dense_public_polys
+                .table_k
+                .clone()
+                .eval(&point_logup_right),
             self.pk
                 .dense_public_polys
                 .table_one
@@ -453,7 +463,6 @@ impl<E: Pairing> Prover<E> {
                 .eval(&point_logup_right),
         ]);
 
-        // Batch-open witness-dependent and preprocessed dense public polynomials.
         let polys = vec![
             z_suf_poly,
             count_poly,
@@ -461,6 +470,7 @@ impl<E: Pairing> Prover<E> {
             tab_inv_poly,
             self.pk.dense_public_polys.weights.clone(),
             self.pk.dense_public_polys.tp.clone(),
+            self.pk.dense_public_polys.tp_one.clone(),
             self.pk.dense_public_polys.table_i.clone(),
             self.pk.dense_public_polys.table_j.clone(),
             self.pk.dense_public_polys.table_k.clone(),
@@ -472,6 +482,7 @@ impl<E: Pairing> Prover<E> {
             point_logup_left.clone(),
             point_logup_right.clone(),
             point3,
+            point_logup_left.clone(),
             point_logup_left,
             point_logup_right.clone(),
             point_logup_right.clone(),
