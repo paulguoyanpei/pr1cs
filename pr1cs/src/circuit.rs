@@ -147,6 +147,7 @@ pub struct Circuit<F: PrimeField> {
     pub tp: Vec<F>,
     pub weights: Vec<F>,
     pub weight_len: usize,
+    pub z_len: usize,
     pub table: Vec<(F, F, F)>,
 }
 
@@ -160,6 +161,7 @@ impl<F: PrimeField> Circuit<F> {
         tp: Vec<LookupType>,
         weights: Vec<F>,
         weight_len: usize,
+        z_len: usize,
         table: Vec<(F, F, F)>,
     ) -> Circuit<F> {
         Circuit {
@@ -177,6 +179,7 @@ impl<F: PrimeField> Circuit<F> {
                 .collect(),
             weights,
             weight_len,
+            z_len,
             table,
         }
     }

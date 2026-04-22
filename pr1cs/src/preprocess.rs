@@ -5,7 +5,10 @@ use util::{
     poly::MlPoly,
 };
 
-use crate::{circuit::Circuit, sparse};
+use crate::{
+    circuit::Circuit,
+    sparse::{self, SparseCommits, SparsePolys},
+};
 
 #[derive(Clone)]
 pub struct DensePublicPolys<F: PrimeField> {
@@ -22,6 +25,7 @@ pub struct ProvingKey<E: Pairing> {
     pub kzg_pp: MkzgProveParams<E>,
     pub circuit: Circuit<E::ScalarField>,
     pub dense_public_polys: DensePublicPolys<E::ScalarField>,
+    pub sparse_polys: SparsePolys<E::ScalarField>,
 }
 
 #[derive(Clone)]
@@ -34,6 +38,7 @@ pub struct VerifierKey<E: Pairing> {
     pub table_j_commit: MkzgCommit<E>,
     pub table_k_commit: MkzgCommit<E>,
     pub table_one_commit: MkzgCommit<E>,
+    pub sparse_commits: SparseCommits<E>,
 }
 
 pub struct Preprocessor;
@@ -44,7 +49,7 @@ impl Preprocessor {
         kzg_vp: MkzgVerParams<E>,
         circuit: Circuit<E::ScalarField>,
     ) -> (ProvingKey<E>, VerifierKey<E>) {
-        sparse::sparse_commit(&circuit);
+        let (sparse_polys, sparse_commits) = sparse::sparse_commit(&kzg_pp, &circuit);
 
         let dense_public_polys = DensePublicPolys {
             weights: MlPoly::new(circuit.weights.clone()),
@@ -64,11 +69,13 @@ impl Preprocessor {
             table_j_commit: Mkzg::<E>::commit(&kzg_pp, &dense_public_polys.table_j),
             table_k_commit: Mkzg::<E>::commit(&kzg_pp, &dense_public_polys.table_k),
             table_one_commit: Mkzg::<E>::commit(&kzg_pp, &dense_public_polys.table_one),
+            sparse_commits,
         };
         let pk = ProvingKey {
             kzg_pp,
             circuit,
             dense_public_polys,
+            sparse_polys,
         };
         (pk, vk)
     }
@@ -196,13 +203,21 @@ mod tests {
             .map(|_| Fr::rand(&mut rng))
             .collect::<Vec<_>>();
 
+        let (kzg_pp, _kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
+        let (sparse_polys, _sparse_commits) = sparse::sparse_commit(&kzg_pp, &circuit);
+        let mut proof = util::util::Proof::<Bn254>::new();
+        let mut ro = RandomOracle::new(&mut rng);
         let evals = sparse::sparse_open(
+            &kzg_pp,
             &circuit,
+            &sparse_polys,
             &point1,
             &point_logup_left,
             &point_suf,
             &point_pre,
             gamma,
+            &mut proof,
+            &mut ro,
         );
         let row_eq_1 = MlPoly::new_eq(&point1).0;
         let row_eq_lu = MlPoly::new_eq(&point_logup_left).0;

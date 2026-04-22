@@ -207,7 +207,19 @@ impl<F: PrimeField> Program<F> {
             }
         }
 
-        return Circuit::<F>::new(a, b, c, d, e, tp, self.weights(), self.weights.len(), table);
+        let z_len = auxiliary_index;
+        return Circuit::<F>::new(
+            a,
+            b,
+            c,
+            d,
+            e,
+            tp,
+            self.weights(),
+            self.weights.len(),
+            z_len,
+            table,
+        );
     }
 
     pub fn weights(&self) -> Vec<F> {

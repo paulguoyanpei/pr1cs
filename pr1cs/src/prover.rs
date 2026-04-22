@@ -435,20 +435,18 @@ impl<E: Pairing> Prover<E> {
 
         let point3 = Self::sumcheck_2(m_pre, z_pre, &mut proof, ro);
 
-        let sparse_evals =
-            sparse::sparse_open(circuit, &point1, &point_logup_left, &point2, &point3, gamma);
-        proof.push_f(&[
-            sparse_evals.a_suf,
-            sparse_evals.b_suf,
-            sparse_evals.c_suf,
-            sparse_evals.d_suf,
-            sparse_evals.e_suf,
-            sparse_evals.a_pre,
-            sparse_evals.b_pre,
-            sparse_evals.c_pre,
-            sparse_evals.d_pre,
-            sparse_evals.e_pre,
-        ]);
+        let _sparse_evals = sparse::sparse_open(
+            &self.pk.kzg_pp,
+            circuit,
+            &self.pk.sparse_polys,
+            &point1,
+            &point_logup_left,
+            &point2,
+            &point3,
+            gamma,
+            &mut proof,
+            ro,
+        );
         proof.push_f(&[
             self.pk.dense_public_polys.weights.clone().eval(&point3),
             self.pk
@@ -501,6 +499,7 @@ impl<E: Pairing> Prover<E> {
         proof.push_u(independent_sumcheck_proof.0.len());
         proof.push_f(&independent_sumcheck_proof.0);
 
+        println!("total time {}", start.elapsed().as_millis());
         proof
     }
 }

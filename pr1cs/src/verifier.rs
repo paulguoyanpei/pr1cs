@@ -6,10 +6,7 @@ use util::{
     util::{batch_inverse, Proof, RandomOracle},
 };
 
-use crate::{
-    preprocess::VerifierKey,
-    sparse::{self, SparseEvals},
-};
+use crate::{preprocess::VerifierKey, sparse};
 
 pub struct Verifier<E: Pairing> {
     vk: VerifierKey<E>,
@@ -81,7 +78,6 @@ impl<E: Pairing> Verifier<E> {
         gamma: E::ScalarField,
         ro: &mut RandomOracle<E::ScalarField>,
     ) {
-        let _ = gamma;
         ro.restart();
 
         // Read z_suf commitment.
@@ -202,19 +198,17 @@ impl<E: Pairing> Verifier<E> {
         let pre_z = proof.next_f();
         assert_eq!(y, pre_m * pre_z);
 
-        let sparse_evals = SparseEvals {
-            a_suf: proof.next_f(),
-            b_suf: proof.next_f(),
-            c_suf: proof.next_f(),
-            d_suf: proof.next_f(),
-            e_suf: proof.next_f(),
-            a_pre: proof.next_f(),
-            b_pre: proof.next_f(),
-            c_pre: proof.next_f(),
-            d_pre: proof.next_f(),
-            e_pre: proof.next_f(),
-        };
-        assert!(sparse::sparse_verify(&sparse_evals));
+        let sparse_evals = sparse::sparse_verify(
+            &self.vk.kzg_vp,
+            &self.vk.sparse_commits,
+            &point1,
+            &point_logup_left,
+            &point_suf,
+            &point_pre,
+            gamma,
+            &mut proof,
+            ro,
+        );
 
         let suf_m_expected = [
             sparse_evals.a_suf,

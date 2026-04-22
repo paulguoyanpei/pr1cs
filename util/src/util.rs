@@ -1,6 +1,6 @@
 use ark_ec::pairing::Pairing;
 use ark_ff::{Field, PrimeField, UniformRand};
-use rand::Rng;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 pub struct Proof<E: Pairing> {
     u: Vec<usize>,
@@ -92,37 +92,60 @@ pub struct RandomOracle<F: Field> {
     ints: Vec<usize>,
     fields_idx: usize,
     ints_idx: usize,
+    rng: StdRng,
 }
 
 impl<F: Field> RandomOracle<F> {
     pub fn new<R: Rng>(rng: &mut R) -> Self {
+        let seed = <StdRng as SeedableRng>::Seed::rand(rng);
         RandomOracle {
-            fields: (0..1000).map(|_| <F as UniformRand>::rand(rng)).collect(),
-            ints: (0..1000).map(|_| usize::rand(rng)).collect(),
+            fields: vec![],
+            ints: vec![],
             fields_idx: 0,
             ints_idx: 0,
+            rng: StdRng::from_seed(seed),
         }
     }
 
+    fn ensure_fields(&mut self, n: usize) {
+        if self.fields.len() >= n {
+            return;
+        }
+        self.fields
+            .extend((self.fields.len()..n).map(|_| <F as UniformRand>::rand(&mut self.rng)));
+    }
+
+    fn ensure_ints(&mut self, n: usize) {
+        if self.ints.len() >= n {
+            return;
+        }
+        self.ints
+            .extend((self.ints.len()..n).map(|_| usize::rand(&mut self.rng)));
+    }
+
     pub fn next_field(&mut self) -> F {
+        self.ensure_fields(self.fields_idx + 1);
         let res = self.fields[self.fields_idx];
         self.fields_idx += 1;
         res
     }
 
     pub fn next_n_fields(&mut self, n: usize) -> Vec<F> {
+        self.ensure_fields(self.fields_idx + n);
         let res = self.fields[self.fields_idx..(self.fields_idx + n)].to_vec();
         self.fields_idx += n;
         res
     }
 
     pub fn next_int(&mut self) -> usize {
+        self.ensure_ints(self.ints_idx + 1);
         let res = self.ints[self.ints_idx];
         self.ints_idx += 1;
         res
     }
 
     pub fn next_n_ints(&mut self, n: usize) -> Vec<usize> {
+        self.ensure_ints(self.ints_idx + n);
         let res = self.ints[self.ints_idx..(self.ints_idx + n)].to_vec();
         self.ints_idx += n;
         res
