@@ -123,6 +123,7 @@ pub struct Circuit<F: PrimeField> {
     pub d: SparseMatrix<F>,
     pub e: SparseMatrix<F>,
     pub tp: Vec<F>,
+    pub weights: Vec<F>,
     pub weight_len: usize,
     pub table: Vec<(F, F, F)>,
 }
@@ -135,6 +136,7 @@ impl<F: PrimeField> Circuit<F> {
         d: SparseMatrix<F>,
         e: SparseMatrix<F>,
         tp: Vec<LookupType>,
+        weights: Vec<F>,
         weight_len: usize,
         table: Vec<(F, F, F)>,
     ) -> Circuit<F> {
@@ -151,6 +153,7 @@ impl<F: PrimeField> Circuit<F> {
                     LookupType::Relu => F::from(2),
                 })
                 .collect(),
+            weights,
             weight_len,
             table,
         }

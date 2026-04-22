@@ -207,7 +207,7 @@ impl<F: PrimeField> Program<F> {
             }
         }
 
-        return Circuit::<F>::new(a, b, c, d, e, tp, self.weights.len(), table);
+        return Circuit::<F>::new(a, b, c, d, e, tp, self.weights(), self.weights.len(), table);
     }
 
     pub fn weights(&self) -> Vec<F> {
@@ -360,7 +360,10 @@ impl<F: PrimeField> Program<F> {
         let mut output_index = output_start;
         for instr in &self.instructions {
             match &instr {
-                &Instruction::AddMult { input1, input2 } => {
+                &Instruction::AddMult {
+                    input1: _,
+                    input2: _,
+                } => {
                     output_index += 1;
                 }
                 &Instruction::Conv {
@@ -411,7 +414,7 @@ impl<F: PrimeField> Program<F> {
                     }
                     output_index += out_channels * plane;
                 }
-                &Instruction::Lookup { input, tp } => {
+                &Instruction::Lookup { input: _, tp: _ } => {
                     output_index += 1;
                 }
                 &Instruction::Quant { input1, input2 } => {
@@ -480,7 +483,8 @@ mod tests {
 
     use super::Program;
     use crate::{
-        circuit::LookupType, instruction::Instruction, prover::Prover, verifier::Verifier,
+        circuit::LookupType, instruction::Instruction, preprocess::Preprocessor, prover::Prover,
+        verifier::Verifier,
     };
 
     fn full_cross_correlation(
@@ -611,10 +615,11 @@ mod tests {
         assert!(circuit.check(z.clone(), gamma));
 
         let (kzg_pp, kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
-        let prover = Prover::new(kzg_pp, circuit.clone());
+        let (pk, vk) = Preprocessor::build(kzg_pp, kzg_vp, circuit);
+        let prover = Prover::new(pk);
         let mut ro = RandomOracle::new(&mut rng);
         let proof = prover.prove(z, gamma, &mut ro);
-        let verifier = Verifier::new(kzg_vp, circuit, program.weights());
+        let verifier = Verifier::new(vk);
         verifier.verify(proof, gamma, &mut ro);
     }
 }

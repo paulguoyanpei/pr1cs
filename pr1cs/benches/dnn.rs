@@ -1,11 +1,11 @@
 use ark_bn254::{Bn254, Fr};
 use ark_ff::{AdditiveGroup, UniformRand};
+use pr1cs::preprocess::Preprocessor;
 use pr1cs::prover::Prover;
 use pr1cs::verifier::Verifier;
 use pr1cs::{circuit::LookupType, instruction::Instruction, program::Program};
 use rand::thread_rng;
 use std::cmp;
-use std::collections::HashSet;
 use util::kzg::Mkzg;
 use util::util::RandomOracle;
 
@@ -92,10 +92,11 @@ fn main() {
 
     let mut rng = thread_rng();
     let (kzg_pp, kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
-    let prover = Prover::new(kzg_pp, circuit.clone());
+    let (pk, vk) = Preprocessor::build(kzg_pp, kzg_vp, circuit);
+    let prover = Prover::new(pk);
     let mut ro = RandomOracle::new(&mut rng);
     let proof = prover.prove(z, gamma, &mut ro);
-    let verifier = Verifier::new(kzg_vp, circuit, program.weights());
+    let verifier = Verifier::new(vk);
     let _ = weight_len;
     verifier.verify(proof, gamma, &mut ro);
     println!("finish DNN!")

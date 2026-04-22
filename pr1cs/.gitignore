@@ -1,1 +1,4 @@
 *.txt
+*.bin
+__pycache__
+dump_weights

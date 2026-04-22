@@ -12,9 +12,9 @@ num-bigint = "0.4"
 util = { path = "../util" }
 
 [[bench]]
-name = "vgg16"
+name = "dnn"
 harness = false
 
 [[bench]]
-name = "dnn"
+name = "vgg16"
 harness = false

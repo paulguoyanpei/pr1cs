@@ -1,322 +1,415 @@
-use ark_bn254::{Bn254, Fr};
-use ark_ff::{AdditiveGroup, UniformRand};
-use pr1cs::prover::Prover;
-use pr1cs::{circuit::LookupType, instruction::Instruction, program::Program};
-use rand::thread_rng;
+// VGG-16 inference on CIFAR-10 through the pr1cs instruction set,
+// designed to produce exactly the same integer logits as
+// ../../VerfCNN/convnet.cpp for the first test image.
+//
+// Layout conventions:
+//   * Feature maps live at contiguous slots in trace order (channel, row, col).
+//   * Conv uses the pr1cs `Conv` instruction, which yields full
+//     cross-correlation of size (n + m - 1); we take the center n x n slice
+//     and discard the border to match VerfCNN's `same` conv (pad = 1).
+//   * Shift-right-by-6 is a `Quant` instruction (a * 1 = 64 * out + r), and
+//     ReLU is a `Lookup` with `LookupType::Relu`. Since ReLU masks the sign,
+//     the difference between C truncation and Rust floor-division on negative
+//     inputs does not propagate into the output.
+//   * Max-pool 2x2 uses `max(a, b) = a + Relu(b - a)` chained three times,
+//     plus a final `AddMult` (×1) to materialize the pooled value into a
+//     single contiguous slot.
+
 use std::cmp;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
-use util::kzg::{Mkzg, MkzgProveParams};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use ark_bn254::{Bn254, Fr};
+use ark_ff::{AdditiveGroup, UniformRand};
+use pr1cs::preprocess::Preprocessor;
+use pr1cs::prover::Prover;
+use pr1cs::verifier::Verifier;
+use pr1cs::{circuit::LookupType, instruction::Instruction, program::Program};
+use rand::thread_rng;
+use util::kzg::Mkzg;
 use util::util::RandomOracle;
-const KERNEL_SIZE: usize = 3;
 
+const KERNEL: usize = 3; // 3x3 conv
+const LAYER_WEIGHT_LEN: [usize; 14] = [
+    1728, 36864, 73728, 147456, 294912, 589824, 589824, 1179648, 2359296, 2359296, 2359296,
+    2359296, 2359296, 5120,
+];
+
+#[derive(Copy, Clone, Debug)]
 enum Layer {
-    Conv(usize), // output channel
-    Pooling,
-    Linear(usize), // output dim
+    Conv(usize),
+    Pool,
+    Linear(usize),
 }
 
-struct Vgg16 {
-    layers: Vec<Layer>,
+const VGG16: &[Layer] = &[
+    Layer::Conv(64), Layer::Conv(64), Layer::Pool,
+    Layer::Conv(128), Layer::Conv(128), Layer::Pool,
+    Layer::Conv(256), Layer::Conv(256), Layer::Conv(256), Layer::Pool,
+    Layer::Conv(512), Layer::Conv(512), Layer::Conv(512), Layer::Pool,
+    Layer::Conv(512), Layer::Conv(512), Layer::Conv(512), Layer::Pool,
+    Layer::Linear(10),
+];
+
+fn data_path(name: &str) -> PathBuf {
+    // `cargo bench` runs with CWD at the crate root (pr1cs/pr1cs).
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push(name);
+    p
 }
 
-const WEIGHT_ALIGN: usize = 15 << 20;
-const INPUT_ALIGN: usize = 1 << 12;
-const TRACE_ALIGN: usize = 3 << 20;
-impl Vgg16 {
-    fn weight_length(
-        &self,
-        mut input_width: usize,
-        mut input_height: usize,
-        mut input_channel: usize,
-    ) -> usize {
-        let mut sum = 0;
-        for i in &self.layers {
-            match i {
-                &Layer::Conv(output_channel) => {
-                    println!(
-                        "{}",
-                        input_channel * output_channel * KERNEL_SIZE * KERNEL_SIZE
-                    );
-                    sum += input_channel * output_channel * KERNEL_SIZE * KERNEL_SIZE;
-                    input_channel = output_channel;
-                    input_height = input_height + 2 - KERNEL_SIZE + 1;
-                    input_width = input_width + 2 - KERNEL_SIZE + 1;
+fn read_i32_bin(path: &Path) -> Vec<i32> {
+    let mut buf = Vec::new();
+    File::open(path)
+        .unwrap_or_else(|e| panic!("open {}: {}", path.display(), e))
+        .read_to_end(&mut buf)
+        .unwrap();
+    assert_eq!(buf.len() % 4, 0, "{} is not a multiple of 4 bytes", path.display());
+    buf.chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+fn read_logits(path: &Path) -> Option<Vec<i64>> {
+    let s = std::fs::read_to_string(path).ok()?;
+    Some(s.lines().map(|l| l.trim().parse::<i64>().unwrap()).collect())
+}
+
+fn signed_to_fr(v: i64) -> Fr {
+    if v >= 0 {
+        Fr::from(v as u64)
+    } else {
+        -Fr::from((-v) as u64)
+    }
+}
+
+/// Layout the whole pr1cs `weights` vector: [1] || conv weights (transposed to
+/// pr1cs (Cin, Cout, kH, kW)) || linear weights (Kin, Mout).
+struct WeightPlan {
+    buf: Vec<i64>,
+    /// Start index (within `buf`) of the weights for each of the 14 learned
+    /// layers (13 convs + 1 linear).
+    layer_start: Vec<usize>,
+}
+
+fn build_weight_plan(raw: &[i32]) -> WeightPlan {
+    let mut buf = vec![1i64];
+    let mut layer_start = Vec::with_capacity(14);
+    let mut off = 0usize;
+
+    // Reconstruct the layout on the fly while scanning VGG16.
+    let mut channels_in = 3usize;
+    let mut learned_idx = 0usize;
+
+    for layer in VGG16 {
+        match layer {
+            Layer::Conv(cout) => {
+                let cout = *cout;
+                let len = LAYER_WEIGHT_LEN[learned_idx];
+                assert_eq!(len, cout * channels_in * KERNEL * KERNEL);
+                layer_start.push(buf.len());
+
+                // VerfCNN layout: (Cout, Cin, kH, kW) - pr1cs layout: (Cin, Cout, kH, kW)
+                let slab = &raw[off..off + len];
+                buf.resize(buf.len() + len, 0);
+                let dest_start = *layer_start.last().unwrap();
+                for d in 0..cout {
+                    for c in 0..channels_in {
+                        for u in 0..KERNEL {
+                            for v in 0..KERNEL {
+                                let src = d * channels_in * KERNEL * KERNEL
+                                    + c * KERNEL * KERNEL
+                                    + u * KERNEL
+                                    + v;
+                                let dst = dest_start
+                                    + (c * cout + d) * KERNEL * KERNEL
+                                    + u * KERNEL
+                                    + v;
+                                buf[dst] = slab[src] as i64;
+                            }
+                        }
+                    }
                 }
-                &Layer::Pooling => {
-                    input_height /= 2;
-                    input_width /= 2;
-                }
-                &Layer::Linear(output_dim) => {
-                    println!(
-                        "{}",
-                        output_dim * (input_channel * input_height * input_width)
-                    );
-                    sum += output_dim * (input_channel * input_height * input_width)
-                }
+                off += len;
+                learned_idx += 1;
+                channels_in = cout;
+            }
+            Layer::Pool => { /* no weights */ }
+            Layer::Linear(mout) => {
+                let len = LAYER_WEIGHT_LEN[learned_idx];
+                // Linear weight layout (Kin, Mout) identical between VerfCNN
+                // and pr1cs MatMult; copy verbatim.
+                layer_start.push(buf.len());
+                buf.extend(raw[off..off + len].iter().map(|&x| x as i64));
+                let _ = mout;
+                off += len;
+                learned_idx += 1;
             }
         }
-        sum
     }
 
-    fn instructions(
-        &self,
-        mut input_width: usize,
-        mut input_height: usize,
-        mut input_channel: usize,
-    ) -> Vec<Instruction> {
-        // let weight_length = self.weight_length(input_width, input_height, input_channel);
-        let mut instructions = vec![];
-        let mut weight_start = 1;
-        let mut input_start = WEIGHT_ALIGN;
-        let input_size = input_channel * input_height * input_width;
-        for (idx, layer) in self.layers.iter().enumerate() {
-            match layer {
-                &Layer::Conv(output_channel) => {
-                    let compute_value = |i: usize, j: usize, c: usize| {
-                        if i == 0 || j == 0 || i == input_height + 1 || j == input_width + 1 {
-                            vec![]
-                        } else {
-                            vec![(
-                                input_start
-                                    + c * input_height * input_width
-                                    + (i - 1) * input_width
-                                    + (j - 1),
-                                1i64,
-                            )]
-                        }
-                    };
-                    for c in 0..input_channel {
-                        for k1 in 0..KERNEL_SIZE {
-                            for k2 in 0..KERNEL_SIZE {
-                                for i in 0..input_height {
-                                    for j in 0..input_width {
-                                        let input1 = compute_value(i + k1, j + k2, c);
-                                        instructions.push(Instruction::AddMult {
-                                            input1,
-                                            input2: vec![(0, 1)],
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if idx == 0 {
-                        input_start += INPUT_ALIGN;
-                    } else {
-                        input_start += input_height * input_width * input_channel;
-                    }
-                    instructions.push(Instruction::MatMult {
-                        m: input_height * input_width,
-                        n: input_channel * KERNEL_SIZE * KERNEL_SIZE,
-                        k: output_channel,
-                        start1: input_start,
-                        start2: weight_start,
-                    });
-                    input_start +=
-                        input_channel * KERNEL_SIZE * KERNEL_SIZE * input_height * input_width;
-                    let compute_value = |i: usize, j: usize, c: usize| {
-                        input_start + c + (i * input_width + j) * output_channel
-                    };
-                    for c in 0..output_channel {
-                        for i in 0..input_height {
-                            for j in 0..input_width {
-                                instructions.push(Instruction::Quant {
-                                    input1: vec![(compute_value(i, j, c), 1)],
-                                    input2: vec![(0, 1)],
-                                });
-                            }
-                        }
-                    }
-                    input_start += output_channel * input_height * input_width;
-                    let compute_value = |i: usize, j: usize, c: usize| {
-                        input_start + c * input_height * input_width + i * input_width + j
-                    };
-                    for c in 0..output_channel {
-                        for i in 0..input_height {
-                            for j in 0..input_width {
-                                instructions.push(Instruction::Lookup {
-                                    input: vec![(compute_value(i, j, c), 1)],
-                                    tp: LookupType::Relu,
-                                });
-                            }
-                        }
-                    }
-                    input_start += output_channel * input_height * input_width;
+    assert_eq!(off, raw.len(), "raw weights not fully consumed");
+    assert_eq!(learned_idx, 14);
+    WeightPlan { buf, layer_start }
+}
 
-                    weight_start += input_channel * output_channel * KERNEL_SIZE * KERNEL_SIZE;
-                    input_channel = output_channel;
+struct ProgramPlan {
+    instructions: Vec<Instruction>,
+    /// Slot (in the full trace) where the 10 logits are written.
+    logits_start: usize,
+    /// First auxiliary index past the trace (feeds `gen_z`).
+    aux_start_hint: usize,
+    /// Start of input block (right after weights).
+    input_start: usize,
+}
+
+/// Build the entire VGG-16 instruction list and return bookkeeping pointers.
+fn build_program(weight_len: usize, input_len: usize, plan: &WeightPlan) -> ProgramPlan {
+    let mut instructions = Vec::new();
+
+    // Trace index of the next value produced by an instruction.
+    let mut next_slot = weight_len + input_len;
+    // Start slot of the current feature map (contiguous (C, H, W) block).
+    let mut fm_start = weight_len;
+    let mut side = 32usize;
+    let mut channels = 3usize;
+
+    let mut learned_idx = 0usize;
+
+    for layer in VGG16 {
+        match layer {
+            Layer::Conv(cout) => {
+                let cout = *cout;
+                let conv_start = next_slot;
+                let conv_side = side + KERNEL - 1;
+                let conv_plane = conv_side * conv_side;
+
+                instructions.push(Instruction::Conv {
+                    n: side,
+                    m: KERNEL,
+                    in_channels: channels,
+                    out_channels: cout,
+                    start1: fm_start,
+                    start2: plan.layer_start[learned_idx],
+                });
+                next_slot += cout * conv_plane;
+
+                // Quant the center n x n of each output channel (discard the
+                // (n+2)x(n+2) border). Order them (d, i, j) so that the Quant
+                // block is a contiguous (cout, side, side) feature map.
+                let quant_start = next_slot;
+                for d in 0..cout {
+                    for i in 0..side {
+                        for j in 0..side {
+                            let src = conv_start
+                                + d * conv_plane
+                                + (i + 1) * conv_side
+                                + (j + 1);
+                            instructions.push(Instruction::Quant {
+                                input1: vec![(src, 1)],
+                                input2: vec![(0, 1)],
+                            });
+                            next_slot += 1;
+                        }
+                    }
                 }
-                &Layer::Pooling => {
-                    let compute_input_index = |i: usize, j: usize, c: usize| {
-                        input_start + c * input_height * input_width + i * input_width + j
-                    };
-                    let compute_output_index = |i: usize, j: usize, c: usize, round: usize| {
-                        let h = input_height / 2;
-                        let w = input_width / 2;
-                        input_start
-                            + input_channel * input_height * input_width
-                            + round * input_channel * h * w
-                            + c * h * w
-                            + i * w
-                            + j
-                    };
-                    for c in 0..input_channel {
-                        for i in 0..(input_width / 2) {
-                            for j in 0..(input_height / 2) {
-                                instructions.push(Instruction::Lookup {
-                                    input: vec![
-                                        (compute_input_index(i * 2, j * 2, c), 1),
-                                        (compute_input_index(i * 2 + 1, j * 2, c), -1),
-                                    ],
-                                    tp: LookupType::Relu,
-                                });
-                            }
+
+                // ReLU (table lookup) on the Quant outputs; same (d, i, j)
+                // ordering so the ReLU block is a contiguous feature map.
+                let relu_start = next_slot;
+                for d in 0..cout {
+                    for i in 0..side {
+                        for j in 0..side {
+                            let src = quant_start + d * side * side + i * side + j;
+                            instructions.push(Instruction::Lookup {
+                                input: vec![(src, 1)],
+                                tp: LookupType::Relu,
+                            });
+                            next_slot += 1;
                         }
                     }
-                    for c in 0..input_channel {
-                        for i in 0..(input_width / 2) {
-                            for j in 0..(input_height / 2) {
-                                instructions.push(Instruction::Lookup {
-                                    input: vec![
-                                        (compute_input_index(i * 2 + 1, j * 2, c), 1),
-                                        (compute_output_index(i, j, c, 0), 1),
-                                        (compute_input_index(i * 2, j * 2 + 1, c), -1),
-                                    ],
-                                    tp: LookupType::Relu,
-                                });
-                            }
-                        }
-                    }
-                    for c in 0..input_channel {
-                        for i in 0..(input_width / 2) {
-                            for j in 0..(input_height / 2) {
-                                instructions.push(Instruction::Lookup {
-                                    input: vec![
-                                        (compute_input_index(i * 2, j * 2 + 1, c), 1),
-                                        (compute_output_index(i, j, c, 1), 1),
-                                        (compute_input_index(i * 2 + 1, j * 2 + 1, c), -1),
-                                    ],
-                                    tp: LookupType::Relu,
-                                });
-                            }
-                        }
-                    }
-                    for c in 0..input_channel {
-                        for i in 0..(input_width / 2) {
-                            for j in 0..(input_height / 2) {
-                                instructions.push(Instruction::AddMult {
-                                    input1: vec![
-                                        (compute_input_index(i * 2 + 1, j * 2 + 1, c), 1),
-                                        (compute_output_index(i, j, c, 2), 1),
-                                    ],
-                                    input2: vec![(0, 1)],
-                                });
-                            }
-                        }
-                    }
-                    input_start += input_channel * input_height * input_width
-                        + 3 * input_channel * (input_height / 2) * (input_width / 2);
-                    input_height /= 2;
-                    input_width /= 2;
                 }
-                &Layer::Linear(output_dim) => {
-                    instructions.push(Instruction::MatMult {
-                        m: 1,
-                        n: input_channel * input_height * input_width,
-                        k: output_dim,
-                        start1: input_start,
-                        start2: weight_start,
-                    });
-                    input_start += input_channel * input_height * input_width + output_dim;
-                    weight_start += output_dim * (input_channel * input_height * input_width)
+
+                fm_start = relu_start;
+                channels = cout;
+                learned_idx += 1;
+            }
+            Layer::Pool => {
+                // 2x2 max pool with stride 2 using `max(a, b) = a + ReLU(b - a)`.
+                let out_side = side / 2;
+                let in_plane = side * side;
+                let out_plane = out_side * out_side;
+
+                // Three ReLUs per output element, then one AddMult to
+                // materialize the pooled value. Emit the ReLUs in a single
+                // 3-per-output block, and the AddMults in a contiguous block
+                // afterwards so the next layer can consume a (C, out, out)
+                // feature map at a single start address.
+                let relu_block_start = next_slot;
+                for c in 0..channels {
+                    for i in 0..out_side {
+                        for j in 0..out_side {
+                            let base = fm_start + c * in_plane;
+                            let a = base + (2 * i) * side + (2 * j);
+                            let b = base + (2 * i) * side + (2 * j + 1);
+                            let cc = base + (2 * i + 1) * side + (2 * j);
+                            let dd = base + (2 * i + 1) * side + (2 * j + 1);
+
+                            let idx = (c * out_side + i) * out_side + j;
+                            let r1_slot = relu_block_start + 3 * idx;
+                            let r2_slot = relu_block_start + 3 * idx + 1;
+
+                            // r1 = ReLU(b - a)
+                            instructions.push(Instruction::Lookup {
+                                input: vec![(b, 1), (a, -1)],
+                                tp: LookupType::Relu,
+                            });
+                            next_slot += 1;
+                            // r2 = ReLU(c - (a + r1))
+                            instructions.push(Instruction::Lookup {
+                                input: vec![(cc, 1), (a, -1), (r1_slot, -1)],
+                                tp: LookupType::Relu,
+                            });
+                            next_slot += 1;
+                            // r3 = ReLU(d - (a + r1 + r2))
+                            instructions.push(Instruction::Lookup {
+                                input: vec![(dd, 1), (a, -1), (r1_slot, -1), (r2_slot, -1)],
+                                tp: LookupType::Relu,
+                            });
+                            next_slot += 1;
+                        }
+                    }
                 }
+
+                // Materialize the max via AddMult: max = (a + r1 + r2 + r3) * 1.
+                let pool_out_start = next_slot;
+                for c in 0..channels {
+                    for i in 0..out_side {
+                        for j in 0..out_side {
+                            let base = fm_start + c * in_plane;
+                            let a = base + (2 * i) * side + (2 * j);
+                            let idx = (c * out_side + i) * out_side + j;
+                            let r1 = relu_block_start + 3 * idx;
+                            let r2 = relu_block_start + 3 * idx + 1;
+                            let r3 = relu_block_start + 3 * idx + 2;
+                            instructions.push(Instruction::AddMult {
+                                input1: vec![(a, 1), (r1, 1), (r2, 1), (r3, 1)],
+                                input2: vec![(0, 1)],
+                            });
+                            next_slot += 1;
+                        }
+                    }
+                }
+                let _ = out_plane;
+
+                fm_start = pool_out_start;
+                side = out_side;
+            }
+            Layer::Linear(mout) => {
+                // Linear layer: input is (channels, side, side) contiguous; we
+                // treat it as a flat K-vector. MatMult(m=1, n=K, k=M) computes
+                // output[0, j] = sum_l A[0, l] * B[l, j], matching VerfCNN's
+                // `mat_mult(x, w, o, K, M)`.
+                let mout = *mout;
+                let k_in = channels * side * side;
+
+                let logits_start = next_slot;
+                instructions.push(Instruction::MatMult {
+                    m: 1,
+                    n: k_in,
+                    k: mout,
+                    start1: fm_start,
+                    start2: plan.layer_start[learned_idx],
+                });
+                next_slot += mout;
+                let _ = learned_idx;
+                return ProgramPlan {
+                    instructions,
+                    logits_start,
+                    aux_start_hint: next_slot,
+                    input_start: weight_len,
+                };
             }
         }
-        assert!(input_start < (18 << 20));
-        assert!(weight_start < (15 << 20));
-        instructions
     }
+
+    unreachable!("VGG16 must end in a Linear layer")
 }
 
 fn main() {
-    let vgg16 = Vgg16 {
-        layers: vec![
-            Layer::Conv(64),
-            Layer::Conv(64),
-            Layer::Pooling,
-            Layer::Conv(128),
-            Layer::Conv(128),
-            Layer::Pooling,
-            Layer::Conv(256),
-            Layer::Conv(256),
-            Layer::Conv(256),
-            Layer::Pooling,
-            Layer::Conv(512),
-            Layer::Conv(512),
-            Layer::Conv(512),
-            Layer::Pooling,
-            Layer::Conv(512),
-            Layer::Conv(512),
-            Layer::Conv(512),
-            Layer::Pooling,
-            Layer::Linear(10),
-        ],
-    };
-    let input_width = 32;
-    let input_height = 32;
-    let input_channel = 3;
-    let file = File::open("weight.txt").unwrap();
-    let reader = BufReader::new(file);
+    // --- load weights, scales, input ------------------------------------
+    let raw_weights = read_i32_bin(&data_path("vgg16_weights.bin"));
+    let raw_input = read_i32_bin(&data_path("vgg16_input.bin"));
+    assert_eq!(raw_input.len(), 3 * 32 * 32);
 
-    let mut weights = vec![1];
-    // Read and parse each line
-    for line in reader.lines() {
-        let int_value: i64 = line.unwrap().parse().unwrap();
-        weights.push(int_value << 1);
+    let plan = build_weight_plan(&raw_weights);
+    let weight_len = plan.buf.len();
+    let input_len = raw_input.len();
+    let program_plan = build_program(weight_len, input_len, &plan);
+
+    let ProgramPlan {
+        instructions,
+        logits_start,
+        aux_start_hint,
+        input_start,
+    } = program_plan;
+
+    println!(
+        "instr count: {}, weight_len: {}, logits_start: {}, expected trace: {}",
+        instructions.len(),
+        weight_len,
+        logits_start,
+        aux_start_hint,
+    );
+    let _ = input_start;
+
+    // --- execute the program and extract logits -------------------------
+    let program = Program::<Fr>::new(instructions, plan.buf);
+    let input_i64: Vec<i64> = raw_input.iter().map(|&x| x as i64).collect();
+    let trace = program.execute(input_i64);
+    assert_eq!(trace.len(), aux_start_hint);
+
+    let logits_fr: Vec<Fr> = trace[logits_start..logits_start + 10].to_vec();
+
+    // --- compare against the Python reference logits --------------------
+    let expected = read_logits(&data_path("vgg16_logits.txt"))
+        .expect("vgg16_logits.txt missing; run tools/reference.py first");
+    assert_eq!(expected.len(), 10);
+    let expected_fr: Vec<Fr> = expected.iter().map(|&v| signed_to_fr(v)).collect();
+    println!("expected logits: {:?}", expected);
+    assert_eq!(
+        logits_fr, expected_fr,
+        "pr1cs logits do not match VerfCNN reference"
+    );
+    println!("logits match VerfCNN reference ✓");
+
+    // --- optional: run the full prover/verifier -------------------------
+    if std::env::var("PR1CS_RUN_PROOF").is_ok() {
+        let mut rng = thread_rng();
+        let gamma = <Fr as UniformRand>::rand(&mut rng);
+        let z = program.gen_z(weight_len + input_len, trace, gamma);
+
+        let mut table = vec![];
+        for i in 0..(1 << 6) {
+            table.push((Fr::ZERO, Fr::from(i), Fr::from(1)));
+        }
+        for i in (-(1 << 16) + 1)..(1 << 16) {
+            table.push((Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2)));
+        }
+
+        let circuit = program.to_circuit(input_len, aux_start_hint, table);
+        circuit.check(z.clone(), gamma);
+        println!("circuit.check ok");
+
+        let mut rng = thread_rng();
+        let (kzg_pp, kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
+        let (pk, vk) = Preprocessor::build(kzg_pp, kzg_vp, circuit);
+        let prover = Prover::new(pk);
+        let mut ro = RandomOracle::new(&mut rng);
+        let proof = prover.prove(z, gamma, &mut ro);
+        let verifier = Verifier::new(vk);
+        verifier.verify(proof, gamma, &mut ro);
+        println!("proof verified ✓");
     }
-    while weights.len() < WEIGHT_ALIGN {
-        weights.push(0);
-    }
-
-    // commit weights
-    let instructions = vgg16.instructions(input_width, input_height, input_channel);
-    let program = Program::<Fr>::new(instructions, weights);
-
-    let file = File::open("input_file.txt").unwrap();
-    let reader = BufReader::new(file);
-    let mut input = vec![];
-    // Read and parse each line
-    for line in reader.lines() {
-        let int_value: i64 = line.unwrap().parse().unwrap();
-        input.push(int_value << 3);
-    }
-    while input.len() < INPUT_ALIGN {
-        input.push(0);
-    }
-
-    let trace = program.execute(input);
-    let aux_start = trace.len();
-
-    let mut rng = thread_rng();
-    let gamma = <Fr as UniformRand>::rand(&mut rng);
-    let z = program.gen_z(WEIGHT_ALIGN, trace, gamma);
-
-    let mut table = vec![];
-    for i in 0..(1 << 6) {
-        table.push((Fr::ZERO, Fr::from(i), Fr::from(1)));
-    }
-    for i in (-(1 << 16) + 1)..(1 << 16) {
-        table.push((Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2)));
-    }
-
-    let circuit = program.to_circuit(INPUT_ALIGN, aux_start, table);
-
-    circuit.check(z.clone(), gamma);
-
-    let mut rng = thread_rng();
-    let (kzg_pp, kzp_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
-    let prover = Prover::new(kzg_pp, circuit);
-    let mut ro = RandomOracle::new(&mut rng);
-    prover.prove(z, gamma, &mut ro);
 }

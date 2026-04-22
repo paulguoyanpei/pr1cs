@@ -1,18 +1,17 @@
 use std::collections::HashMap;
 
 use ark_ec::pairing::Pairing;
-use ark_ff::{AdditiveGroup, One, PrimeField, Zero};
+use ark_ff::{AdditiveGroup, One, Zero};
 use util::{
-    kzg::{Mkzg, MkzgProveParams},
+    kzg::Mkzg,
     poly::MlPoly,
     util::{batch_inverse, Proof, RandomOracle},
 };
 
-use crate::circuit::Circuit;
+use crate::{preprocess::ProvingKey, sparse};
 
 pub struct Prover<E: Pairing> {
-    kzg_pp: MkzgProveParams<E>,
-    circuit: Circuit<E::ScalarField>,
+    pk: ProvingKey<E>,
 }
 
 impl<E: Pairing> Prover<E> {
@@ -124,11 +123,8 @@ impl<E: Pairing> Prover<E> {
         new_point
     }
 
-    pub fn new(pp: MkzgProveParams<E>, c: Circuit<E::ScalarField>) -> Self {
-        Prover {
-            kzg_pp: pp,
-            circuit: c,
-        }
+    pub fn new(pk: ProvingKey<E>) -> Self {
+        Prover { pk }
     }
 
     fn count(ele: &Vec<E::ScalarField>, tab: &Vec<E::ScalarField>) -> Vec<E::ScalarField> {
@@ -279,29 +275,30 @@ impl<E: Pairing> Prover<E> {
         ro: &mut RandomOracle<E::ScalarField>,
     ) -> Proof<E> {
         let mut proof = Proof::new();
-        let wei_len = self.circuit.weight_len;
+        let circuit = &self.pk.circuit;
+        let wei_len = circuit.weight_len;
 
         // Commit z_suf up-front (witness, independent of any challenge).
         let z_suf_poly = MlPoly::new(z[wei_len..].to_vec());
-        let z_suf_commit = Mkzg::<E>::commit(&self.kzg_pp, &z_suf_poly);
+        let z_suf_commit = Mkzg::<E>::commit(&self.pk.kzg_pp, &z_suf_poly);
         proof.push_u(z_suf_commit.0.len());
         proof.push_gs(&z_suf_commit.0);
 
-        let cons_line = self.circuit.a.len();
-        let lu_line = self.circuit.d.len();
+        let cons_line = circuit.a.len();
+        let lu_line = circuit.d.len();
         let mut a = vec![];
         let mut b = vec![];
         let mut c = vec![];
         for cr in 0..cons_line {
-            a.push(self.circuit.a.mult_vec_at(cr, &z, gamma));
-            b.push(self.circuit.b.mult_vec_at(cr, &z, gamma));
-            c.push(self.circuit.c.mult_vec_at(cr, &z, gamma));
+            a.push(circuit.a.mult_vec_at(cr, &z, gamma));
+            b.push(circuit.b.mult_vec_at(cr, &z, gamma));
+            c.push(circuit.c.mult_vec_at(cr, &z, gamma));
         }
         let mut d = vec![];
         let mut e = vec![];
         for i in 0..lu_line {
-            d.push(self.circuit.d.mult_vec_at(i, &z, gamma));
-            e.push(self.circuit.e.mult_vec_at(i, &z, gamma));
+            d.push(circuit.d.mult_vec_at(i, &z, gamma));
+            e.push(circuit.e.mult_vec_at(i, &z, gamma));
         }
 
         let point1 = Self::sumcheck_1(a, b, c, &mut proof, ro);
@@ -310,10 +307,10 @@ impl<E: Pairing> Prover<E> {
         let alpha = ro.next_field();
         let mut ele = vec![];
         for i in 0..lu_line {
-            ele.push(((self.circuit.tp[i] * r) + e[i]) * r + d[i]);
+            ele.push(((circuit.tp[i] * r) + e[i]) * r + d[i]);
         }
         let mut tab = vec![];
-        for &(i, j, k) in &self.circuit.table {
+        for &(i, j, k) in &circuit.table {
             tab.push(((k * r) + j) * r + i);
         }
         let count = Self::count(&ele, &tab);
@@ -325,15 +322,15 @@ impl<E: Pairing> Prover<E> {
 
         // Commit count, ele_inv, tab_inv (depend on challenges r, alpha).
         let count_poly = MlPoly::new(count.clone());
-        let count_commit = Mkzg::<E>::commit(&self.kzg_pp, &count_poly);
+        let count_commit = Mkzg::<E>::commit(&self.pk.kzg_pp, &count_poly);
         proof.push_u(count_commit.0.len());
         proof.push_gs(&count_commit.0);
         let ele_inv_poly = MlPoly::new(ele_inv.clone());
-        let ele_inv_commit = Mkzg::<E>::commit(&self.kzg_pp, &ele_inv_poly);
+        let ele_inv_commit = Mkzg::<E>::commit(&self.pk.kzg_pp, &ele_inv_poly);
         proof.push_u(ele_inv_commit.0.len());
         proof.push_gs(&ele_inv_commit.0);
         let tab_inv_poly = MlPoly::new(tab_inv.clone());
-        let tab_inv_commit = Mkzg::<E>::commit(&self.kzg_pp, &tab_inv_poly);
+        let tab_inv_commit = Mkzg::<E>::commit(&self.pk.kzg_pp, &tab_inv_poly);
         proof.push_u(tab_inv_commit.0.len());
         proof.push_gs(&tab_inv_commit.0);
 
@@ -343,18 +340,18 @@ impl<E: Pairing> Prover<E> {
         proof.push_f(&[
             MlPoly::new(d).eval(&point_logup_left),
             MlPoly::new(e).eval(&point_logup_left),
-            MlPoly::new(self.circuit.tp.clone()).eval(&point_logup_left),
+            MlPoly::new(circuit.tp.clone()).eval(&point_logup_left),
         ]);
         let point_logup_right =
             Self::logup_sumcheck_right(tab, tab_inv, count, alpha, &mut proof, ro);
 
         let eq_v = MlPoly::new_eq(&point1).0;
-        let a = self.circuit.a.vec_mult(&eq_v, z.len(), gamma);
-        let b = self.circuit.b.vec_mult(&eq_v, z.len(), gamma);
-        let c = self.circuit.c.vec_mult(&eq_v, z.len(), gamma);
+        let a = circuit.a.vec_mult(&eq_v, z.len(), gamma);
+        let b = circuit.b.vec_mult(&eq_v, z.len(), gamma);
+        let c = circuit.c.vec_mult(&eq_v, z.len(), gamma);
         let eq_v = MlPoly::new_eq(&point_logup_left).0;
-        let d = self.circuit.d.vec_mult(&eq_v, z.len(), gamma);
-        let e = self.circuit.e.vec_mult(&eq_v, z.len(), gamma);
+        let d = circuit.d.vec_mult(&eq_v, z.len(), gamma);
+        let e = circuit.e.vec_mult(&eq_v, z.len(), gamma);
 
         let a_suf = a[wei_len..].to_vec();
         let b_suf = b[wei_len..].to_vec();
@@ -421,17 +418,68 @@ impl<E: Pairing> Prover<E> {
             m_pre[i] += a_pre[i];
         }
 
-        let _point3 = Self::sumcheck_2(m_pre, z_pre, &mut proof, ro);
+        let point3 = Self::sumcheck_2(m_pre, z_pre, &mut proof, ro);
 
-        // Batch-open the four committed polynomials at their respective points.
-        let polys = vec![z_suf_poly, count_poly, ele_inv_poly, tab_inv_poly];
+        let sparse_evals = sparse::sparse_open(
+            circuit,
+            &point1,
+            &point_logup_left,
+            &point2,
+            &point3,
+            gamma,
+        );
+        proof.push_f(&[
+            sparse_evals.a_suf,
+            sparse_evals.b_suf,
+            sparse_evals.c_suf,
+            sparse_evals.d_suf,
+            sparse_evals.e_suf,
+            sparse_evals.a_pre,
+            sparse_evals.b_pre,
+            sparse_evals.c_pre,
+            sparse_evals.d_pre,
+            sparse_evals.e_pre,
+        ]);
+        proof.push_f(&[
+            self.pk.dense_public_polys.weights.clone().eval(&point3),
+            self.pk.dense_public_polys.tp.clone().eval(&point_logup_left),
+            self.pk.dense_public_polys.table_i.clone().eval(&point_logup_right),
+            self.pk.dense_public_polys.table_j.clone().eval(&point_logup_right),
+            self.pk.dense_public_polys.table_k.clone().eval(&point_logup_right),
+            self.pk
+                .dense_public_polys
+                .table_one
+                .clone()
+                .eval(&point_logup_right),
+        ]);
+
+        // Batch-open witness-dependent and preprocessed dense public polynomials.
+        let polys = vec![
+            z_suf_poly,
+            count_poly,
+            ele_inv_poly,
+            tab_inv_poly,
+            self.pk.dense_public_polys.weights.clone(),
+            self.pk.dense_public_polys.tp.clone(),
+            self.pk.dense_public_polys.table_i.clone(),
+            self.pk.dense_public_polys.table_j.clone(),
+            self.pk.dense_public_polys.table_k.clone(),
+            self.pk.dense_public_polys.table_one.clone(),
+        ];
         let points = vec![
             point2,
             point_logup_right.clone(),
+            point_logup_left.clone(),
+            point_logup_right.clone(),
+            point3,
             point_logup_left,
-            point_logup_right,
+            point_logup_right.clone(),
+            point_logup_right.clone(),
+            point_logup_right.clone(),
+            point_logup_right.clone(),
         ];
-        let (kzg_proof, sumcheck_proof) = Mkzg::<E>::batch_open(&self.kzg_pp, &polys, &points, ro);
+        let (kzg_proof, sumcheck_proof) =
+            Mkzg::<E>::batch_open(&self.pk.kzg_pp, &polys, &points, ro);
         proof.push_u(kzg_proof.0.len());
         proof.push_gs(&kzg_proof.0);
         proof.push_u(sumcheck_proof.0.len());
