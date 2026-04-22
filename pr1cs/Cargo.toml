@@ -9,6 +9,7 @@ ark-ff = "0.5"
 rand = "0.8"
 ark-bn254 = "0.5"
 num-bigint = "0.4"
+rayon = "1.10"
 util = { path = "../util" }
 
 [[bench]]
