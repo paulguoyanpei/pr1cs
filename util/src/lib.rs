@@ -1,3 +1,3 @@
 pub mod kzg;
-pub mod util;
 pub mod poly;
+pub mod util;

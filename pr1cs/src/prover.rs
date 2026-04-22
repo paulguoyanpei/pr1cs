@@ -380,7 +380,27 @@ impl<E: Pairing> Prover<E> {
         }
         let point2 = Self::sumcheck_2(m_suf, z_suf, &mut proof, ro);
 
-        println!("{}", start.elapsed().as_millis());
+        // Finish witness-dependent PCS openings before the online-cost cutoff.
+        let dependent_polys = vec![
+            z_suf_poly.clone(),
+            count_poly.clone(),
+            ele_inv_poly.clone(),
+            tab_inv_poly.clone(),
+        ];
+        let dependent_points = vec![
+            point2.clone(),
+            point_logup_right.clone(),
+            point_logup_left.clone(),
+            point_logup_right.clone(),
+        ];
+        let (dependent_kzg_proof, dependent_sumcheck_proof) =
+            Mkzg::<E>::batch_open(&self.pk.kzg_pp, &dependent_polys, &dependent_points, ro);
+        proof.push_u(dependent_kzg_proof.0.len());
+        proof.push_gs(&dependent_kzg_proof.0);
+        proof.push_u(dependent_sumcheck_proof.0.len());
+        proof.push_f(&dependent_sumcheck_proof.0);
+
+        println!("Online cost {}", start.elapsed().as_millis());
         let a_pre = circuit.a.vec_mult_pre(&eq_sc1, wei_len, gamma);
         let b_pre = circuit.b.vec_mult_pre(&eq_sc1, wei_len, gamma);
         let c_pre = circuit.c.vec_mult_pre(&eq_sc1, wei_len, gamma);
@@ -438,11 +458,6 @@ impl<E: Pairing> Prover<E> {
                 .eval(&point_logup_left),
             self.pk
                 .dense_public_polys
-                .tp_one
-                .clone()
-                .eval(&point_logup_left),
-            self.pk
-                .dense_public_polys
                 .table_i
                 .clone()
                 .eval(&point_logup_right),
@@ -463,38 +478,28 @@ impl<E: Pairing> Prover<E> {
                 .eval(&point_logup_right),
         ]);
 
-        let polys = vec![
-            z_suf_poly,
-            count_poly,
-            ele_inv_poly,
-            tab_inv_poly,
+        let independent_polys = vec![
             self.pk.dense_public_polys.weights.clone(),
             self.pk.dense_public_polys.tp.clone(),
-            self.pk.dense_public_polys.tp_one.clone(),
             self.pk.dense_public_polys.table_i.clone(),
             self.pk.dense_public_polys.table_j.clone(),
             self.pk.dense_public_polys.table_k.clone(),
             self.pk.dense_public_polys.table_one.clone(),
         ];
-        let points = vec![
-            point2,
-            point_logup_right.clone(),
-            point_logup_left.clone(),
-            point_logup_right.clone(),
+        let independent_points = vec![
             point3,
             point_logup_left.clone(),
-            point_logup_left,
             point_logup_right.clone(),
             point_logup_right.clone(),
             point_logup_right.clone(),
             point_logup_right.clone(),
         ];
-        let (kzg_proof, sumcheck_proof) =
-            Mkzg::<E>::batch_open(&self.pk.kzg_pp, &polys, &points, ro);
-        proof.push_u(kzg_proof.0.len());
-        proof.push_gs(&kzg_proof.0);
-        proof.push_u(sumcheck_proof.0.len());
-        proof.push_f(&sumcheck_proof.0);
+        let (independent_kzg_proof, independent_sumcheck_proof) =
+            Mkzg::<E>::batch_open(&self.pk.kzg_pp, &independent_polys, &independent_points, ro);
+        proof.push_u(independent_kzg_proof.0.len());
+        proof.push_gs(&independent_kzg_proof.0);
+        proof.push_u(independent_sumcheck_proof.0.len());
+        proof.push_f(&independent_sumcheck_proof.0);
 
         proof
     }

@@ -478,7 +478,7 @@ mod tests {
 
     use ark_bn254::{Bn254, Fr};
     use ark_ff::UniformRand;
-    use rand::{SeedableRng, rngs::StdRng};
+    use rand::{rngs::StdRng, SeedableRng};
     use util::{kzg::Mkzg, util::RandomOracle};
 
     use super::Program;
@@ -573,9 +573,7 @@ mod tests {
         let in_channels = 2;
         let out_channels = 2;
 
-        let raw_weights = vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 1, -1, 2, -2, 3, -3, 4, -4,
-        ];
+        let raw_weights = vec![1, 2, 3, 4, 5, 6, 7, 8, 1, -1, 2, -2, 3, -3, 4, -4];
         let input = vec![1, 2, 3, 4, -1, 0, 2, 1];
 
         let mut weights = vec![1];

@@ -34,9 +34,15 @@ pub fn sparse_open<F: PrimeField>(
     let wei_len = circuit.weight_len;
 
     SparseEvals {
-        a_suf: circuit.a.mle(&row_eq_1, &col_eq_suf, wei_len, usize::MAX, gamma),
-        b_suf: circuit.b.mle(&row_eq_1, &col_eq_suf, wei_len, usize::MAX, gamma),
-        c_suf: circuit.c.mle(&row_eq_1, &col_eq_suf, wei_len, usize::MAX, gamma),
+        a_suf: circuit
+            .a
+            .mle(&row_eq_1, &col_eq_suf, wei_len, usize::MAX, gamma),
+        b_suf: circuit
+            .b
+            .mle(&row_eq_1, &col_eq_suf, wei_len, usize::MAX, gamma),
+        c_suf: circuit
+            .c
+            .mle(&row_eq_1, &col_eq_suf, wei_len, usize::MAX, gamma),
         d_suf: circuit
             .d
             .mle(&row_eq_lu, &col_eq_suf, wei_len, usize::MAX, gamma),

@@ -157,6 +157,28 @@ impl<E: Pairing> Verifier<E> {
         let suf_z = proof.next_f();
         assert_eq!(y, suf_m * suf_z);
 
+        // Verify witness-dependent PCS openings before consuming preprocessed challenges.
+        let dependent_kzg_proof_len = proof.next_u();
+        let dependent_kzg_proof = MkzgProof(proof.next_n_gs(dependent_kzg_proof_len));
+        let dependent_sumcheck_proof_len = proof.next_u();
+        let dependent_sumcheck_proof = SumcheckProof(proof.next_n_fs(dependent_sumcheck_proof_len));
+        let dependent_points = vec![
+            point_suf.clone(),
+            point_logup_right.clone(),
+            point_logup_left.clone(),
+            point_logup_right.clone(),
+        ];
+        let dependent_comms = vec![z_suf_commit, count_commit, ele_inv_commit, tab_inv_commit];
+        let dependent_values = vec![suf_z, count, ele_inv, tab_inv];
+        assert!(Mkzg::batch_verify(
+            &self.vk.kzg_vp,
+            &dependent_points,
+            &dependent_comms,
+            &dependent_values,
+            (dependent_kzg_proof, dependent_sumcheck_proof),
+            ro,
+        ));
+
         let pre_values = proof.next_n_fs(5);
         let r_pre = ro.next_field();
         let (point_pre, y) = Self::sumcheck(
@@ -224,7 +246,6 @@ impl<E: Pairing> Verifier<E> {
 
         let weights = proof.next_f();
         let tp = proof.next_f();
-        let tp_one = proof.next_f();
         let table_i = proof.next_f();
         let table_j = proof.next_f();
         let table_k = proof.next_f();
@@ -239,52 +260,42 @@ impl<E: Pairing> Verifier<E> {
                 .copied()
                 .reduce(|acc, v| acc * r_lut + v)
                 .unwrap()
-                + alpha * tp_one
+                + alpha
         );
-        assert_eq!(tab, ((table_k * r_lut) + table_j) * r_lut + table_i + alpha * table_one);
+        assert_eq!(
+            tab,
+            ((table_k * r_lut) + table_j) * r_lut + table_i + alpha * table_one
+        );
 
-        // Batch-verify witness-dependent and preprocessed dense PCS openings.
-        let kzg_proof_len = proof.next_u();
-        let kzg_proof = MkzgProof(proof.next_n_gs(kzg_proof_len));
-        let sumcheck_proof_len = proof.next_u();
-        let sumcheck_proof = SumcheckProof(proof.next_n_fs(sumcheck_proof_len));
-
-        let points = vec![
-            point_suf,
-            point_logup_right.clone(),
-            point_logup_left.clone(),
-            point_logup_right.clone(),
+        // Then batch-verify instance-independent dense PCS openings.
+        let independent_kzg_proof_len = proof.next_u();
+        let independent_kzg_proof = MkzgProof(proof.next_n_gs(independent_kzg_proof_len));
+        let independent_sumcheck_proof_len = proof.next_u();
+        let independent_sumcheck_proof =
+            SumcheckProof(proof.next_n_fs(independent_sumcheck_proof_len));
+        let independent_points = vec![
             point_pre,
             point_logup_left.clone(),
-            point_logup_left,
             point_logup_right.clone(),
             point_logup_right.clone(),
             point_logup_right.clone(),
             point_logup_right,
         ];
-        let comms = vec![
-            z_suf_commit,
-            count_commit,
-            ele_inv_commit,
-            tab_inv_commit,
+        let independent_comms = vec![
             self.vk.weights_commit.clone(),
             self.vk.tp_commit.clone(),
-            self.vk.tp_one_commit.clone(),
             self.vk.table_i_commit.clone(),
             self.vk.table_j_commit.clone(),
             self.vk.table_k_commit.clone(),
             self.vk.table_one_commit.clone(),
         ];
-        let values = vec![
-            suf_z, count, ele_inv, tab_inv, weights, tp, tp_one, table_i, table_j, table_k,
-            table_one,
-        ];
+        let independent_values = vec![weights, tp, table_i, table_j, table_k, table_one];
         assert!(Mkzg::batch_verify(
             &self.vk.kzg_vp,
-            &points,
-            &comms,
-            &values,
-            (kzg_proof, sumcheck_proof),
+            &independent_points,
+            &independent_comms,
+            &independent_values,
+            (independent_kzg_proof, independent_sumcheck_proof),
             ro,
         ));
     }
