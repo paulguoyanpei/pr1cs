@@ -10,26 +10,16 @@ use util::{
 
 use crate::circuit::{Circuit, SparseMatrix};
 
-// 10 individual (matrix, split) pairs: a_suf, b_suf, c_suf, d_suf, e_suf,
-// a_pre, b_pre, c_pre, d_pre, e_pre. We collapse them into 4 supergroups
-// keyed by (row_table, col_table):
+// Claim ordering matches SparseEvals::as_array:
+//   a_suf, b_suf, c_suf, d_suf, e_suf, a_pre, b_pre, c_pre, d_pre, e_pre.
 //
-//   SG 0: row_abc, col_suf  = {a, b, c} x suf
-//   SG 1: row_de,  col_suf  = {d, e}    x suf
-//   SG 2: row_abc, col_pre  = {a, b, c} x pre
-//   SG 3: row_de,  col_pre  = {d, e}    x pre
-//
-// Inside a supergroup, the individual matrix claims are batched via RLC into a
-// single degree-5 product sumcheck, and the three per-lookup (row / col / pow)
-// memory-check left-sides are also RLC'd into a single degree-3 sumcheck.
+// The sparse proof only proves the five suffix claims, batched into a single
+// Protocol-1-style opening. b_pre is intentionally trusted by the verifier; the
+// remaining prefix claims must be zero.
 pub const NUM_CLAIMS: usize = 10;
-pub const NUM_SUPERGROUPS: usize = 4;
+pub const NUM_SUPERGROUPS: usize = 1;
 
-// Claim indices for each supergroup, in the order they appear in the SG.
-// Claim ordering matches SparseEvals::as_array: a_suf=0, b_suf=1, c_suf=2,
-// d_suf=3, e_suf=4, a_pre=5, b_pre=6, c_pre=7, d_pre=8, e_pre=9.
-const SUPERGROUP_CLAIMS: [&[usize]; NUM_SUPERGROUPS] =
-    [&[0, 1, 2], &[3, 4], &[5, 6, 7], &[8, 9]];
+const SUF_CLAIMS: &[usize] = &[0, 1, 2, 3, 4];
 
 #[derive(Clone)]
 pub struct SparseSupergroup<F: PrimeField> {
@@ -144,6 +134,33 @@ fn gamma_mle<F: Field>(point: &[F], gamma: F) -> F {
     acc
 }
 
+fn pad_point<F: Field>(point: &[F], len: usize) -> Vec<F> {
+    let mut out = point.to_vec();
+    out.resize(len, F::zero());
+    out
+}
+
+fn combined_row_table<F: PrimeField>(
+    point_abc: &[F],
+    point_de: &[F],
+    row_base_log: usize,
+) -> Vec<F> {
+    let mut abc = MlPoly::new_eq(&pad_point(point_abc, row_base_log)).0;
+    let mut de = MlPoly::new_eq(&pad_point(point_de, row_base_log)).0;
+    abc.append(&mut de);
+    abc
+}
+
+fn combined_row_mle<F: PrimeField>(point_abc: &[F], point_de: &[F], point: &[F]) -> F {
+    assert!(!point.is_empty());
+    let row_base_log = point.len() - 1;
+    let lower = point[..row_base_log].to_vec();
+    let flag = point[row_base_log];
+    let abc = MlPoly::<F>::eval_eq(&pad_point(point_abc, row_base_log), &lower);
+    let de = MlPoly::<F>::eval_eq(&pad_point(point_de, row_base_log), &lower);
+    abc * (F::one() - flag) + de * flag
+}
+
 // MLE of indicator [i < n] at `point`.
 fn prefix_mle<F: Field>(point: &[F], n: usize) -> F {
     let nv = point.len();
@@ -201,13 +218,25 @@ fn collect_entries<F: PrimeField>(
 
 fn build_supergroup<F: PrimeField>(
     per_matrix: Vec<Vec<(usize, usize, F, usize)>>,
-    log_row: usize,
+    row_base_log: usize,
     log_col: usize,
     log_pow: usize,
 ) -> SparseSupergroup<F> {
     let matrix_lens: Vec<usize> = per_matrix.iter().map(|v| v.len()).collect();
-    let mut entries: Vec<(usize, usize, F, usize)> =
-        per_matrix.into_iter().flatten().collect();
+    let log_row = row_base_log + 1;
+    let mut entries = Vec::new();
+    for (matrix_idx, matrix_entries) in per_matrix.into_iter().enumerate() {
+        let row_flag = if matrix_idx < 3 {
+            0usize
+        } else {
+            1usize << row_base_log
+        };
+        entries.extend(
+            matrix_entries
+                .into_iter()
+                .map(|(r, c, v, p)| (row_flag + r, c, v, p)),
+        );
+    }
     if entries.is_empty() {
         entries.push((0, 0, F::zero(), 0));
     }
@@ -264,12 +293,10 @@ pub fn sparse_commit<E: Pairing>(
 
     let log_row_abc = log2_ceil(cons_line);
     let log_row_de = log2_ceil(lu_line);
+    let row_base_log = log_row_abc.max(log_row_de);
     let log_col_suf = log2_ceil(z_len - wei_len);
-    let log_col_pre = log2_ceil(wei_len);
 
-    let mats = [
-        &circuit.a, &circuit.b, &circuit.c, &circuit.d, &circuit.e,
-    ];
+    let mats = [&circuit.a, &circuit.b, &circuit.c, &circuit.d, &circuit.e];
     let max_pow = mats
         .iter()
         .flat_map(|m| m.rows.iter())
@@ -279,27 +306,17 @@ pub fn sparse_commit<E: Pairing>(
         .unwrap_or(0);
     let log_pow = log2_ceil(max_pow + 1);
 
-    // Helper: build a single supergroup by collecting entries of selected
-    // matrices and split (suf=true: col >= wei_len, else col < wei_len).
-    let mk_sg =
-        |matrices: &[usize], log_row: usize, log_col: usize, suf: bool| -> SparseSupergroup<_> {
-            let (col_lo, col_hi) = if suf { (wei_len, usize::MAX) } else { (0, wei_len) };
-            let per_matrix: Vec<Vec<(usize, usize, _, usize)>> = matrices
-                .iter()
-                .map(|&m| collect_entries(mats[m], col_lo, col_hi))
-                .collect();
-            build_supergroup(per_matrix, log_row, log_col, log_pow)
-        };
+    let per_matrix: Vec<Vec<(usize, usize, _, usize)>> = (0..5)
+        .map(|m| collect_entries(mats[m], wei_len, usize::MAX))
+        .collect();
+    let supergroups: Vec<SparseSupergroup<_>> = vec![build_supergroup(
+        per_matrix,
+        row_base_log,
+        log_col_suf,
+        log_pow,
+    )];
 
-    let supergroups: Vec<SparseSupergroup<_>> = vec![
-        mk_sg(&[0, 1, 2], log_row_abc, log_col_suf, true),
-        mk_sg(&[3, 4], log_row_de, log_col_suf, true),
-        mk_sg(&[0, 1, 2], log_row_abc, log_col_pre, false),
-        mk_sg(&[3, 4], log_row_de, log_col_pre, false),
-    ];
-
-    // Commit all 7 preprocessed polys per supergroup. Each commit is an MSM so
-    // we parallelize across supergroups (4 independent tasks).
+    // Commit all static preprocessed polys for the single suffix batch group.
     let commits: Vec<SparseSupergroupCommit<E>> = supergroups
         .par_iter()
         .map(|g| SparseSupergroupCommit {
@@ -320,7 +337,9 @@ pub fn sparse_commit<E: Pairing>(
 
     (
         SparsePolys { supergroups },
-        SparseCommits { supergroups: commits },
+        SparseCommits {
+            supergroups: commits,
+        },
     )
 }
 
@@ -328,9 +347,9 @@ pub fn sparse_commit<E: Pairing>(
 // Sumcheck helpers: prover side.
 // ============================================================
 
-// Degree-5 weighted product sumcheck: prove sum_t w[t]*a[t]*b[t]*c[t]*d[t].
-fn sumcheck_main_weighted<E: Pairing>(
-    mut w: Vec<E::ScalarField>,
+// Degree-4 product sumcheck:
+//     sum_t a[t] * b[t] * c[t] * d[t].
+fn sumcheck_main4<E: Pairing>(
     mut a: Vec<E::ScalarField>,
     mut b: Vec<E::ScalarField>,
     mut c: Vec<E::ScalarField>,
@@ -338,67 +357,103 @@ fn sumcheck_main_weighted<E: Pairing>(
     proof: &mut Proof<E>,
     ro: &mut RandomOracle<E::ScalarField>,
 ) -> Vec<E::ScalarField> {
-    assert_eq!(w.len(), a.len());
-    assert_eq!(w.len(), b.len());
-    assert_eq!(w.len(), c.len());
-    assert_eq!(w.len(), d.len());
-    proof.push_u(w.len());
-    let log_len = log2_ceil(w.len());
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), c.len());
+    assert_eq!(a.len(), d.len());
+    proof.push_u(a.len());
+    let log_len = log2_ceil(a.len());
     let mut new_point = vec![];
     for _ in 0..log_len {
-        if w.len() % 2 == 1 {
-            w.push(E::ScalarField::zero());
+        if a.len() % 2 == 1 {
             a.push(E::ScalarField::zero());
             b.push(E::ScalarField::zero());
             c.push(E::ScalarField::zero());
             d.push(E::ScalarField::zero());
         }
-        let m = w.len();
-        // Degree 5 => 6 evaluations at X = 0, 1, 2, 3, 4, 5.
-        let mut sums = [E::ScalarField::zero(); 6];
+        let m = a.len();
+        // Degree 4 => 5 evaluations at X = 0, 1, 2, 3, 4.
+        let mut sums = [E::ScalarField::zero(); 5];
         for j in (0..m).step_by(2) {
-            let dw = w[j + 1] - w[j];
             let da = a[j + 1] - a[j];
             let db = b[j + 1] - b[j];
             let dc = c[j + 1] - c[j];
             let dd = d[j + 1] - d[j];
-            // X=0 and X=1 are direct values.
-            sums[0] += w[j] * a[j] * b[j] * c[j] * d[j];
-            sums[1] += w[j + 1] * a[j + 1] * b[j + 1] * c[j + 1] * d[j + 1];
-            // X=k for k>=2: extrapolated val = val[j+1] + (k-1) * diff.
-            let mut wv = w[j + 1];
+            sums[0] += a[j] * b[j] * c[j] * d[j];
+            sums[1] += a[j + 1] * b[j + 1] * c[j + 1] * d[j + 1];
             let mut av = a[j + 1];
             let mut bv = b[j + 1];
             let mut cv = c[j + 1];
             let mut dv = d[j + 1];
-            for k in 2..=5 {
-                wv += dw;
+            for k in 2..=4 {
                 av += da;
                 bv += db;
                 cv += dc;
                 dv += dd;
-                sums[k] += wv * av * bv * cv * dv;
+                sums[k] += av * bv * cv * dv;
             }
         }
         proof.push_f(&sums);
         let challenge = ro.next_field();
         new_point.push(challenge);
         for i in 0..m / 2 {
-            w[i] = w[i * 2] + (w[i * 2 + 1] - w[i * 2]) * challenge;
             a[i] = a[i * 2] + (a[i * 2 + 1] - a[i * 2]) * challenge;
             b[i] = b[i * 2] + (b[i * 2 + 1] - b[i * 2]) * challenge;
             c[i] = c[i * 2] + (c[i * 2 + 1] - c[i * 2]) * challenge;
             d[i] = d[i * 2] + (d[i * 2 + 1] - d[i * 2]) * challenge;
         }
-        w.truncate(m / 2);
         a.truncate(m / 2);
         b.truncate(m / 2);
         c.truncate(m / 2);
         d.truncate(m / 2);
     }
-    assert_eq!(w.len(), 1);
-    // Push a, b, c, d (verifier recomputes w from prefix_mle).
+    assert_eq!(a.len(), 1);
     proof.push_f(&[a[0], b[0], c[0], d[0]]);
+    new_point
+}
+
+fn sumcheck_vrho_consistency<E: Pairing>(
+    point: &[E::ScalarField],
+    mut w: Vec<E::ScalarField>,
+    mut val: Vec<E::ScalarField>,
+    proof: &mut Proof<E>,
+    ro: &mut RandomOracle<E::ScalarField>,
+) -> Vec<E::ScalarField> {
+    assert_eq!(w.len(), val.len());
+    proof.push_u(w.len());
+    let log_len = log2_ceil(w.len());
+    let mut eq = MlPoly::new_eq(&point.to_vec()).0;
+    eq.truncate(w.len());
+    let mut new_point = vec![];
+    for _ in 0..log_len {
+        if w.len() % 2 == 1 {
+            eq.push(E::ScalarField::zero());
+            w.push(E::ScalarField::zero());
+            val.push(E::ScalarField::zero());
+        }
+        let m = w.len();
+        let mut sums = [E::ScalarField::zero(); 4];
+        for j in (0..m).step_by(2) {
+            let deq = eq[j + 1] - eq[j];
+            let dw = w[j + 1] - w[j];
+            let dval = val[j + 1] - val[j];
+            sums[0] += eq[j] * w[j] * val[j];
+            sums[1] += eq[j + 1] * w[j + 1] * val[j + 1];
+            sums[2] += (eq[j + 1] + deq) * (w[j + 1] + dw) * (val[j + 1] + dval);
+            sums[3] += (eq[j + 1] + deq + deq) * (w[j + 1] + dw + dw) * (val[j + 1] + dval + dval);
+        }
+        proof.push_f(&sums);
+        let challenge = ro.next_field();
+        new_point.push(challenge);
+        for i in 0..m / 2 {
+            eq[i] = eq[i * 2] + (eq[i * 2 + 1] - eq[i * 2]) * challenge;
+            w[i] = w[i * 2] + (w[i * 2 + 1] - w[i * 2]) * challenge;
+            val[i] = val[i * 2] + (val[i * 2 + 1] - val[i * 2]) * challenge;
+        }
+        eq.truncate(m / 2);
+        w.truncate(m / 2);
+        val.truncate(m / 2);
+    }
+    proof.push_f(&[eq[0], w[0], val[0]]);
     new_point
 }
 
@@ -554,8 +609,8 @@ fn logup_sumcheck_right<E: Pairing>(
             let diff_tab_inv = tab_inv[j + 1] - tab_inv[j];
             let diff_count = count[j + 1] - count[j];
             let diff_eq = eq[j + 1] - eq[j];
-            sums[0] += (tab[j] * tab_inv[j] - E::ScalarField::one()) * eq[j]
-                + r * tab_inv[j] * count[j];
+            sums[0] +=
+                (tab[j] * tab_inv[j] - E::ScalarField::one()) * eq[j] + r * tab_inv[j] * count[j];
             sums[1] += (tab[j + 1] * tab_inv[j + 1] - E::ScalarField::one()) * eq[j + 1]
                 + r * tab_inv[j + 1] * count[j + 1];
             sums[2] += ((tab[j + 1] + diff_tab) * (tab_inv[j + 1] + diff_tab_inv)
@@ -615,7 +670,9 @@ fn uni_extrapolate<F: PrimeField>(base: &Vec<F>, v: &Vec<F>, x: F) -> F {
     for i in 1..n + 1 {
         prod *= x - F::from(i as u32);
     }
-    let mut numerator = (0..n + 1).map(|y| x - F::from(y as u32)).collect::<Vec<_>>();
+    let mut numerator = (0..n + 1)
+        .map(|y| x - F::from(y as u32))
+        .collect::<Vec<_>>();
     batch_inverse(&mut numerator);
     let mut res = F::zero();
     for i in 0..n + 1 {
@@ -654,7 +711,10 @@ struct ProverAcc<F: PrimeField> {
 
 impl<F: PrimeField> ProverAcc<F> {
     fn new() -> Self {
-        ProverAcc { polys: vec![], points: vec![] }
+        ProverAcc {
+            polys: vec![],
+            points: vec![],
+        }
     }
     fn push(&mut self, poly: MlPoly<F>, point: Vec<F>) {
         self.polys.push(poly);
@@ -670,7 +730,11 @@ struct VerifierAcc<E: Pairing> {
 
 impl<E: Pairing> VerifierAcc<E> {
     fn new() -> Self {
-        VerifierAcc { commits: vec![], points: vec![], values: vec![] }
+        VerifierAcc {
+            commits: vec![],
+            points: vec![],
+            values: vec![],
+        }
     }
     fn push(&mut self, commit: MkzgCommit<E>, point: Vec<E::ScalarField>, value: E::ScalarField) {
         self.commits.push(commit);
@@ -687,7 +751,8 @@ impl<E: Pairing> VerifierAcc<E> {
 fn lasso_prove_supergroup<E: Pairing>(
     kzg_pp: &MkzgProveParams<E>,
     sg: &SparseSupergroup<E::ScalarField>,
-    row_eq_point: &[E::ScalarField],
+    point_abc: &[E::ScalarField],
+    point_de: &[E::ScalarField],
     col_eq_point: &[E::ScalarField],
     gamma: E::ScalarField,
     claims: &[E::ScalarField],
@@ -695,11 +760,11 @@ fn lasso_prove_supergroup<E: Pairing>(
     ro: &mut RandomOracle<E::ScalarField>,
     acc: &mut ProverAcc<E::ScalarField>,
 ) {
-    assert_eq!(row_eq_point.len(), sg.log_row);
     assert_eq!(col_eq_point.len(), sg.log_col);
     assert_eq!(claims.len(), sg.matrix_lens.len());
 
-    let row_eq = MlPoly::new_eq(&row_eq_point.to_vec()).0;
+    let row_base_log = sg.log_row - 1;
+    let row_eq = combined_row_table(point_abc, point_de, row_base_log);
     let col_eq = MlPoly::new_eq(&col_eq_point.to_vec()).0;
 
     let gamma_table: Vec<E::ScalarField> = {
@@ -713,12 +778,9 @@ fn lasso_prove_supergroup<E: Pairing>(
     };
 
     // Table reads — parallel over entries.
-    let e_row: Vec<E::ScalarField> =
-        sg.row_idx.par_iter().map(|&i| row_eq[i]).collect();
-    let e_col: Vec<E::ScalarField> =
-        sg.col_idx.par_iter().map(|&i| col_eq[i]).collect();
-    let e_gamma: Vec<E::ScalarField> =
-        sg.pow_idx.par_iter().map(|&i| gamma_table[i]).collect();
+    let e_row: Vec<E::ScalarField> = sg.row_idx.par_iter().map(|&i| row_eq[i]).collect();
+    let e_col: Vec<E::ScalarField> = sg.col_idx.par_iter().map(|&i| col_eq[i]).collect();
+    let e_gamma: Vec<E::ScalarField> = sg.pow_idx.par_iter().map(|&i| gamma_table[i]).collect();
 
     let e_row_poly = MlPoly::new(e_row.clone());
     let e_col_poly = MlPoly::new(e_col.clone());
@@ -734,44 +796,53 @@ fn lasso_prove_supergroup<E: Pairing>(
     }
 
     // Main sumcheck: RLC the `k` matrix claims into a single sumcheck.
-    //   combined = sum_i r_m^i * claim_i = sum_t w[t] * e_row[t] * e_col[t] * val[t] * e_gamma[t]
-    // where w[t] = r_m^{matrix_idx_at_t}.
+    // The RLC weight is multiplied into a dynamic V_rho polynomial, reducing
+    // the product degree from 5 to 4.
     let r_m = ro.next_field();
     let mut cum = vec![0usize];
     for &ml in &sg.matrix_lens {
         cum.push(cum.last().unwrap() + ml);
     }
     let mut w_vec: Vec<E::ScalarField> = Vec::with_capacity(sg.len);
+    let mut v_rho_vec: Vec<E::ScalarField> = Vec::with_capacity(sg.len);
     {
         let mut r_pow = E::ScalarField::one();
         for (i, &ml) in sg.matrix_lens.iter().enumerate() {
-            for _ in 0..ml {
+            for j in 0..ml {
                 w_vec.push(r_pow);
+                v_rho_vec.push(sg.val.0[cum[i] + j] * r_pow);
             }
             if i + 1 < sg.matrix_lens.len() {
                 r_pow *= r_m;
             }
         }
         // Pad with zeros to match sg.len (for the dummy-zero case).
-        while w_vec.len() < sg.len {
+        while v_rho_vec.len() < sg.len {
             w_vec.push(E::ScalarField::zero());
+            v_rho_vec.push(E::ScalarField::zero());
         }
     }
+    let v_rho_poly = MlPoly::new(v_rho_vec.clone());
+    let v_rho_commit = Mkzg::<E>::commit(kzg_pp, &v_rho_poly);
+    proof.push_u(v_rho_commit.0.len());
+    proof.push_gs(&v_rho_commit.0);
 
-    let point_main = sumcheck_main_weighted::<E>(
-        w_vec,
+    let point_main = sumcheck_main4::<E>(
         e_row.clone(),
         e_col.clone(),
-        sg.val.0.clone(),
         e_gamma.clone(),
+        v_rho_vec,
         proof,
         ro,
     );
+    let point_vrho =
+        sumcheck_vrho_consistency::<E>(&point_main, w_vec, sg.val.0.clone(), proof, ro);
 
     acc.push(e_row_poly.clone(), point_main.clone());
     acc.push(e_col_poly.clone(), point_main.clone());
-    acc.push(sg.val.clone(), point_main.clone());
-    acc.push(e_gamma_poly.clone(), point_main);
+    acc.push(e_gamma_poly.clone(), point_main.clone());
+    acc.push(v_rho_poly, point_main);
+    acc.push(sg.val.clone(), point_vrho);
 
     // Memory-check setup: sample three betas, then alpha, then rho for RLC.
     let beta_row = ro.next_field();
@@ -822,8 +893,16 @@ fn lasso_prove_supergroup<E: Pairing>(
 
     // Combined logup-left sumcheck.
     let point_l = combined_logup_left::<E>(
-        ele_row, eir.clone(), ele_col, eic.clone(), ele_pow, eig.clone(),
-        alpha, rho, proof, ro,
+        ele_row,
+        eir.clone(),
+        ele_col,
+        eic.clone(),
+        ele_pow,
+        eig.clone(),
+        alpha,
+        rho,
+        proof,
+        ro,
     );
 
     // Open idx and e polys at point_l.
@@ -833,7 +912,14 @@ fn lasso_prove_supergroup<E: Pairing>(
     let e_row_v_l = e_row_poly.clone().eval(&point_l);
     let e_col_v_l = e_col_poly.clone().eval(&point_l);
     let e_gamma_v_l = e_gamma_poly.clone().eval(&point_l);
-    proof.push_f(&[row_idx_v, col_idx_v, pow_idx_v, e_row_v_l, e_col_v_l, e_gamma_v_l]);
+    proof.push_f(&[
+        row_idx_v,
+        col_idx_v,
+        pow_idx_v,
+        e_row_v_l,
+        e_col_v_l,
+        e_gamma_v_l,
+    ]);
 
     acc.push(sg.row.clone(), point_l.clone());
     acc.push(sg.col.clone(), point_l.clone());
@@ -847,7 +933,9 @@ fn lasso_prove_supergroup<E: Pairing>(
 
     // Three memory-right sumchecks (one per table). Work in parallel on tab and tab_inv
     // construction, but each sumcheck itself must run sequentially (shared RO & proof).
-    let build_right = |table: &[E::ScalarField], beta: E::ScalarField| -> (Vec<E::ScalarField>, Vec<E::ScalarField>) {
+    let build_right = |table: &[E::ScalarField],
+                       beta: E::ScalarField|
+     -> (Vec<E::ScalarField>, Vec<E::ScalarField>) {
         let tab: Vec<E::ScalarField> = (0..table.len())
             .into_par_iter()
             .map(|i| E::ScalarField::from(i as u64) + beta * table[i])
@@ -888,14 +976,8 @@ fn lasso_prove_supergroup<E: Pairing>(
         .into_iter()
         .zip(tab_inv_polys.into_iter().zip(right_inputs.iter()))
     {
-        let point_r = logup_sumcheck_right::<E>(
-            tab,
-            tab_inv,
-            count_poly.0.clone(),
-            alpha,
-            proof,
-            ro,
-        );
+        let point_r =
+            logup_sumcheck_right::<E>(tab, tab_inv, count_poly.0.clone(), alpha, proof, ro);
         acc.push(tip, point_r.clone());
         acc.push((*count_poly).clone(), point_r);
     }
@@ -949,29 +1031,13 @@ pub fn sparse_open<E: Pairing>(
     let claim_array = sparse_evals.as_array();
     let mut acc = ProverAcc::<E::ScalarField>::new();
 
-    for sg_idx in 0..NUM_SUPERGROUPS {
-        let sg = &polys.supergroups[sg_idx];
-        let row_eq_point = if sg_idx % 2 == 0 { point_abc } else { point_de };
-        let col_eq_point = if sg_idx < 2 { point_suf } else { point_pre };
-        let claims: Vec<E::ScalarField> = SUPERGROUP_CLAIMS[sg_idx]
-            .iter()
-            .map(|&i| claim_array[i])
-            .collect();
-        lasso_prove_supergroup::<E>(
-            kzg_pp,
-            sg,
-            row_eq_point,
-            col_eq_point,
-            gamma,
-            &claims,
-            proof,
-            ro,
-            &mut acc,
-        );
-    }
+    let sg = &polys.supergroups[0];
+    let claims: Vec<E::ScalarField> = SUF_CLAIMS.iter().map(|&i| claim_array[i]).collect();
+    lasso_prove_supergroup::<E>(
+        kzg_pp, sg, point_abc, point_de, point_suf, gamma, &claims, proof, ro, &mut acc,
+    );
 
-    let (kzg_proof, sumcheck_proof) =
-        Mkzg::<E>::batch_open(kzg_pp, &acc.polys, &acc.points, ro);
+    let (kzg_proof, sumcheck_proof) = Mkzg::<E>::batch_open(kzg_pp, &acc.polys, &acc.points, ro);
     proof.push_u(kzg_proof.0.len());
     proof.push_gs(&kzg_proof.0);
     proof.push_u(sumcheck_proof.0.len());
@@ -987,7 +1053,8 @@ pub fn sparse_open<E: Pairing>(
 #[allow(clippy::too_many_arguments)]
 fn lasso_verify_supergroup<E: Pairing>(
     sg_commit: &SparseSupergroupCommit<E>,
-    row_eq_point: &[E::ScalarField],
+    point_abc: &[E::ScalarField],
+    point_de: &[E::ScalarField],
     col_eq_point: &[E::ScalarField],
     gamma: E::ScalarField,
     claims: &[E::ScalarField],
@@ -995,7 +1062,6 @@ fn lasso_verify_supergroup<E: Pairing>(
     ro: &mut RandomOracle<E::ScalarField>,
     acc: &mut VerifierAcc<E>,
 ) {
-    assert_eq!(row_eq_point.len(), sg_commit.log_row);
     assert_eq!(col_eq_point.len(), sg_commit.log_col);
     assert_eq!(claims.len(), sg_commit.matrix_lens.len());
 
@@ -1008,8 +1074,10 @@ fn lasso_verify_supergroup<E: Pairing>(
     let e_col_commit = read_commit(proof);
     let e_gamma_commit = read_commit(proof);
 
-    // RLC challenge for matrix claims.
+    // RLC challenge for matrix claims. The prover commits V_rho after rho is
+    // sampled, then proves V_rho = W_rho * val at the main sumcheck point.
     let r_m = ro.next_field();
+    let v_rho_commit = read_commit(proof);
     let mut cum = vec![0usize];
     for &ml in &sg_commit.matrix_lens {
         cum.push(cum.last().unwrap() + ml);
@@ -1025,19 +1093,32 @@ fn lasso_verify_supergroup<E: Pairing>(
 
     let len_main = proof.next_u();
     let nv_main = log2_ceil(len_main);
-    let (point_main, y_main) =
-        verifier_sumcheck::<E>(combined_claim, nv_main, 5, proof, ro);
+    let (point_main, y_main) = verifier_sumcheck::<E>(combined_claim, nv_main, 4, proof, ro);
     let e_row_v = proof.next_f();
     let e_col_v = proof.next_f();
-    let val_v = proof.next_f();
     let e_gamma_v = proof.next_f();
-    let w_v = weight_mle::<E::ScalarField>(&point_main, &cum, r_m);
-    assert_eq!(y_main, w_v * e_row_v * e_col_v * val_v * e_gamma_v);
+    let v_rho_v = proof.next_f();
+    assert_eq!(y_main, e_row_v * e_col_v * e_gamma_v * v_rho_v);
+
+    let len_vrho = proof.next_u();
+    let nv_vrho = log2_ceil(len_vrho);
+    assert_eq!(nv_vrho, nv_main);
+    let (point_vrho, y_vrho) = verifier_sumcheck::<E>(v_rho_v, nv_vrho, 3, proof, ro);
+    let eq_v = proof.next_f();
+    let w_v = proof.next_f();
+    let val_v = proof.next_f();
+    assert_eq!(
+        eq_v,
+        MlPoly::eval_eq_pref(&point_main, &point_vrho, len_vrho)
+    );
+    assert_eq!(w_v, weight_mle::<E::ScalarField>(&point_vrho, &cum, r_m));
+    assert_eq!(y_vrho, eq_v * w_v * val_v);
 
     acc.push(e_row_commit.clone(), point_main.clone(), e_row_v);
     acc.push(e_col_commit.clone(), point_main.clone(), e_col_v);
-    acc.push(sg_commit.val.clone(), point_main.clone(), val_v);
-    acc.push(e_gamma_commit.clone(), point_main, e_gamma_v);
+    acc.push(e_gamma_commit.clone(), point_main.clone(), e_gamma_v);
+    acc.push(v_rho_commit, point_main, v_rho_v);
+    acc.push(sg_commit.val.clone(), point_vrho, val_v);
 
     // Memory-check setup — mirror prover order.
     let beta_row = ro.next_field();
@@ -1071,11 +1152,9 @@ fn lasso_verify_supergroup<E: Pairing>(
     let eig_v = proof.next_f();
     let eq_pref = MlPoly::eval_eq_pref(&r_eq_l, &point_l, len_l);
     let one = E::ScalarField::one();
-    let combined_rhs = ((er_v * eir_v - one)
-        + rho * (ec_v * eic_v - one)
-        + rho2 * (eg_v * eig_v - one))
-        * eq_pref
-        + r_sum_l * (eir_v + rho * eic_v + rho2 * eig_v);
+    let combined_rhs =
+        ((er_v * eir_v - one) + rho * (ec_v * eic_v - one) + rho2 * (eg_v * eig_v - one)) * eq_pref
+            + r_sum_l * (eir_v + rho * eic_v + rho2 * eig_v);
     assert_eq!(y_l, combined_rhs);
 
     let row_idx_v = proof.next_f();
@@ -1114,9 +1193,7 @@ fn lasso_verify_supergroup<E: Pairing>(
         beta_row,
         s_row,
         sg_commit.log_row,
-        |pt| {
-            MlPoly::<E::ScalarField>::eval_eq(&row_eq_point.to_vec(), &pt.to_vec())
-        },
+        |pt| combined_row_mle::<E::ScalarField>(point_abc, point_de, pt),
         tab_inv_row_commit,
         sg_commit.count_row.clone(),
         acc,
@@ -1129,9 +1206,7 @@ fn lasso_verify_supergroup<E: Pairing>(
         beta_col,
         s_col,
         sg_commit.log_col,
-        |pt| {
-            MlPoly::<E::ScalarField>::eval_eq(&col_eq_point.to_vec(), &pt.to_vec())
-        },
+        |pt| MlPoly::<E::ScalarField>::eval_eq(&col_eq_point.to_vec(), &pt.to_vec()),
         tab_inv_col_commit,
         sg_commit.count_col.clone(),
         acc,
@@ -1176,8 +1251,7 @@ fn verify_memory_right<E: Pairing>(
     let eq_pref = MlPoly::eval_eq_pref(&r_eq, &point_r, len_r);
     assert_eq!(
         y_r,
-        (tab_v * tab_inv_v - E::ScalarField::one()) * eq_pref
-            + r_sum * tab_inv_v * count_v
+        (tab_v * tab_inv_v - E::ScalarField::one()) * eq_pref + r_sum * tab_inv_v * count_v
     );
     let expected_tab_v =
         alpha + identity_mle::<E::ScalarField>(&point_r) + beta * table_mle_at(&point_r);
@@ -1193,7 +1267,7 @@ pub fn sparse_verify<E: Pairing>(
     point_abc: &[E::ScalarField],
     point_de: &[E::ScalarField],
     point_suf: &[E::ScalarField],
-    point_pre: &[E::ScalarField],
+    _point_pre: &[E::ScalarField],
     gamma: E::ScalarField,
     proof: &mut Proof<E>,
     ro: &mut RandomOracle<E::ScalarField>,
@@ -1203,27 +1277,17 @@ pub fn sparse_verify<E: Pairing>(
     claims_arr.copy_from_slice(&arr);
     let evals = SparseEvals::from_array(claims_arr);
     let claim_array = evals.as_array();
+    assert_eq!(evals.a_pre, E::ScalarField::zero());
+    assert_eq!(evals.c_pre, E::ScalarField::zero());
+    assert_eq!(evals.d_pre, E::ScalarField::zero());
+    assert_eq!(evals.e_pre, E::ScalarField::zero());
 
     let mut acc = VerifierAcc::<E>::new();
-    for sg_idx in 0..NUM_SUPERGROUPS {
-        let sg_commit = &commits.supergroups[sg_idx];
-        let row_eq_point = if sg_idx % 2 == 0 { point_abc } else { point_de };
-        let col_eq_point = if sg_idx < 2 { point_suf } else { point_pre };
-        let claims: Vec<E::ScalarField> = SUPERGROUP_CLAIMS[sg_idx]
-            .iter()
-            .map(|&i| claim_array[i])
-            .collect();
-        lasso_verify_supergroup::<E>(
-            sg_commit,
-            row_eq_point,
-            col_eq_point,
-            gamma,
-            &claims,
-            proof,
-            ro,
-            &mut acc,
-        );
-    }
+    let sg_commit = &commits.supergroups[0];
+    let claims: Vec<E::ScalarField> = SUF_CLAIMS.iter().map(|&i| claim_array[i]).collect();
+    lasso_verify_supergroup::<E>(
+        sg_commit, point_abc, point_de, point_suf, gamma, &claims, proof, ro, &mut acc,
+    );
 
     let kzg_len = proof.next_u();
     let kzg_proof = MkzgProof(proof.next_n_gs(kzg_len));

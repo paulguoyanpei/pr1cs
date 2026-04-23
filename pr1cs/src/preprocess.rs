@@ -92,7 +92,7 @@ mod tests {
 
     use super::Preprocessor;
     use crate::{
-        circuit::{Circuit, LookupType},
+        circuit::{Circuit, LookupType, SparseMatrix},
         instruction::Instruction,
         program::Program,
         prover::Prover,
@@ -140,8 +140,64 @@ mod tests {
         (program, input, circuit, conv_output_start)
     }
 
+    fn dnn_like_fixture() -> Circuit<Fr> {
+        let weights = vec![1, 1, 0, 0, 1];
+        let input = vec![1, 2];
+        let instructions = vec![
+            Instruction::MatMult {
+                m: 1,
+                n: 2,
+                k: 2,
+                start1: weights.len(),
+                start2: 1,
+            },
+            Instruction::Quant {
+                input1: vec![(weights.len() + input.len(), 1)],
+                input2: vec![(0, 1)],
+            },
+            Instruction::Lookup {
+                input: vec![(weights.len() + input.len() + 2, 1)],
+                tp: LookupType::Relu,
+            },
+        ];
+        let program = Program::<Fr>::new(instructions, weights);
+        let trace = program.execute(input.clone());
+        let table = (-64i64..=64)
+            .map(|i| (Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2u64)))
+            .collect::<Vec<_>>();
+        program.to_circuit(input.len(), trace.len(), table)
+    }
+
     fn log_len(len: usize) -> usize {
         (len.saturating_sub(1).ilog2() as usize) + 1
+    }
+
+    fn split_nonzeros(mat: &SparseMatrix<Fr>, weight_len: usize) -> (usize, usize) {
+        let mut pre = 0;
+        let mut suf = 0;
+        for row in &mat.rows {
+            for &(col, _, _) in &row.elems {
+                if col < weight_len {
+                    pre += 1;
+                } else {
+                    suf += 1;
+                }
+            }
+        }
+        (pre, suf)
+    }
+
+    fn assert_only_b_has_prefix_nonzeros(circuit: &Circuit<Fr>) {
+        let (a_pre, _) = split_nonzeros(&circuit.a, circuit.weight_len);
+        let (b_pre, _) = split_nonzeros(&circuit.b, circuit.weight_len);
+        let (c_pre, _) = split_nonzeros(&circuit.c, circuit.weight_len);
+        let (d_pre, _) = split_nonzeros(&circuit.d, circuit.weight_len);
+        let (e_pre, _) = split_nonzeros(&circuit.e, circuit.weight_len);
+        assert_eq!(a_pre, 0);
+        assert!(b_pre > 0);
+        assert_eq!(c_pre, 0);
+        assert_eq!(d_pre, 0);
+        assert_eq!(e_pre, 0);
     }
 
     #[test]
@@ -203,8 +259,8 @@ mod tests {
             .map(|_| Fr::rand(&mut rng))
             .collect::<Vec<_>>();
 
-        let (kzg_pp, _kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
-        let (sparse_polys, _sparse_commits) = sparse::sparse_commit(&kzg_pp, &circuit);
+        let (kzg_pp, kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
+        let (sparse_polys, sparse_commits) = sparse::sparse_commit(&kzg_pp, &circuit);
         let mut proof = util::util::Proof::<Bn254>::new();
         let mut ro = RandomOracle::new(&mut rng);
         let evals = sparse::sparse_open(
@@ -275,6 +331,92 @@ mod tests {
             evals.e_pre,
             circuit.e.mle(&row_eq_lu, &col_eq_pre, 0, wei_len, gamma)
         );
+        assert_eq!(evals.a_pre, Fr::from(0u64));
+        assert_eq!(evals.c_pre, Fr::from(0u64));
+        assert_eq!(evals.d_pre, Fr::from(0u64));
+        assert_eq!(evals.e_pre, Fr::from(0u64));
+
+        ro.restart();
+        let verified = sparse::sparse_verify(
+            &kzg_vp,
+            &sparse_commits,
+            &point1,
+            &point_logup_left,
+            &point_suf,
+            &point_pre,
+            gamma,
+            &mut proof,
+            &mut ro,
+        );
+        assert_eq!(verified.b_pre, evals.b_pre);
+    }
+
+    #[test]
+    fn sparse_commit_uses_single_suffix_batch_layout() {
+        let (_program, _input, conv_circuit, _output_start) = sample_fixture();
+        let dnn_circuit = dnn_like_fixture();
+        let mut rng = StdRng::seed_from_u64(19);
+        let (kzg_pp, _kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
+
+        for circuit in [&conv_circuit, &dnn_circuit] {
+            assert_only_b_has_prefix_nonzeros(circuit);
+            let (polys, commits) = sparse::sparse_commit(&kzg_pp, circuit);
+            assert_eq!(polys.supergroups.len(), 1);
+            assert_eq!(commits.supergroups.len(), 1);
+            assert_eq!(polys.supergroups[0].matrix_lens.len(), 5);
+            assert_eq!(
+                commits.supergroups[0].matrix_lens,
+                polys.supergroups[0].matrix_lens
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_verify_rejects_nonzero_unproved_prefix_claims() {
+        let (_program, _input, mut circuit, _output_start) = sample_fixture();
+        circuit.a.rows[0].elems.push((1, Fr::from(1u64), None));
+
+        let mut rng = StdRng::seed_from_u64(29);
+        let gamma = Fr::from(7u64);
+        let point1 = vec![Fr::from(0u64); log_len(circuit.a.len())];
+        let point_logup_left = vec![Fr::from(0u64); log_len(circuit.d.len())];
+        let point_suf = vec![Fr::from(0u64); log_len(circuit.z_len - circuit.weight_len)];
+        let mut point_pre = vec![Fr::from(0u64); log_len(circuit.weight_len)];
+        point_pre[0] = Fr::from(1u64);
+
+        let (kzg_pp, kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
+        let (sparse_polys, sparse_commits) = sparse::sparse_commit(&kzg_pp, &circuit);
+        let mut proof = util::util::Proof::<Bn254>::new();
+        let mut ro = RandomOracle::new(&mut rng);
+        let evals = sparse::sparse_open(
+            &kzg_pp,
+            &circuit,
+            &sparse_polys,
+            &point1,
+            &point_logup_left,
+            &point_suf,
+            &point_pre,
+            gamma,
+            &mut proof,
+            &mut ro,
+        );
+        assert_eq!(evals.a_pre, Fr::from(1u64));
+
+        ro.restart();
+        let rejected = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            sparse::sparse_verify(
+                &kzg_vp,
+                &sparse_commits,
+                &point1,
+                &point_logup_left,
+                &point_suf,
+                &point_pre,
+                gamma,
+                &mut proof,
+                &mut ro,
+            );
+        }));
+        assert!(rejected.is_err());
     }
 
     #[test]
