@@ -107,8 +107,8 @@ impl<E: Pairing> Verifier<E> {
         let tab_inv_commit = MkzgCommit(proof.next_n_gs(tab_inv_commit_len));
 
         let sum = proof.next_f();
-        let len = proof.next_u();
-        let nv = (len - 1).ilog2() as usize + 1;
+        let len_left = proof.next_u();
+        let nv = (len_left - 1).ilog2() as usize + 1;
         let r = ro.next_n_fields(nv);
         let r_sum = ro.next_field();
         let (point_logup_left, y) = Self::sumcheck(sum * r_sum, nv, 3, &mut proof, ro);
@@ -117,7 +117,7 @@ impl<E: Pairing> Verifier<E> {
         assert_eq!(
             y,
             (ele * ele_inv - E::ScalarField::ONE)
-                * MlPoly::eval_eq_pref(&r, &point_logup_left, len)
+                * MlPoly::eval_eq_pref(&r, &point_logup_left, len_left)
                 + r_sum * ele_inv
         );
         let logup_values = proof.next_n_fs(3);
@@ -254,7 +254,7 @@ impl<E: Pairing> Verifier<E> {
                 .copied()
                 .reduce(|acc, v| acc * r_lut + v)
                 .unwrap()
-                + alpha
+                + alpha * MlPoly::<E::ScalarField>::eval_ones_pref(&point_logup_left, len_left)
         );
         assert_eq!(
             tab,

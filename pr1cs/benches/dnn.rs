@@ -9,9 +9,9 @@ use std::cmp;
 use util::kzg::Mkzg;
 use util::util::RandomOracle;
 
-const LAYER_COUNT: usize = 1;
-const HIDDEN_DIM: usize = 1 << 8;
-const SEQ_LEN: usize = 1 << 4;
+const LAYER_COUNT: usize = 16;
+const HIDDEN_DIM: usize = 128;
+const SEQ_LEN: usize = 1;
 const INPUT_ALIGN: usize = HIDDEN_DIM * SEQ_LEN;
 
 fn instructions(weight_len: usize) -> Vec<Instruction> {
@@ -56,8 +56,10 @@ fn main() {
     let mut rng = thread_rng();
     let mut weights = vec![1];
     for _ in 0..LAYER_COUNT {
-        for _ in 0..(1 << 16) {
-            weights.push(1 << 6);
+        for l in 0..HIDDEN_DIM {
+            for j in 0..HIDDEN_DIM {
+                weights.push(if l == j { 1 } else { 0 });
+            }
         }
     }
     let weight_len = weights.len();

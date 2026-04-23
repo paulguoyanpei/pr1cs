@@ -296,6 +296,56 @@ mod tests {
     }
 
     #[test]
+    fn verify_with_non_power_of_two_lookup_count() {
+        // Three lookups → lu_line = 3, which is NOT a power of two. Exercises the
+        // logup-left indicator term that was missing from the verifier before.
+        let mut weights = vec![1i64];
+        weights.extend([1, -1, 2, -2, 3, -3, 4, -4]);
+        let input = vec![1i64, 2, 3, 4, -1, 0, 2, 1];
+        let conv_output_start = weights.len() + input.len();
+        let instructions = vec![
+            Instruction::Conv {
+                n: 2,
+                m: 2,
+                in_channels: 2,
+                out_channels: 1,
+                start1: weights.len(),
+                start2: 1,
+            },
+            Instruction::Lookup {
+                input: vec![(conv_output_start, 1)],
+                tp: LookupType::Relu,
+            },
+            Instruction::Lookup {
+                input: vec![(conv_output_start + 1, 1)],
+                tp: LookupType::Relu,
+            },
+            Instruction::Lookup {
+                input: vec![(conv_output_start + 2, 1)],
+                tp: LookupType::Relu,
+            },
+        ];
+        let program = Program::<Fr>::new(instructions, weights);
+        let trace = program.execute(input.clone());
+        let aux_start = trace.len();
+        let table = (-64i64..=64)
+            .map(|i| (Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2u64)))
+            .collect::<Vec<_>>();
+        let circuit = program.to_circuit(input.len(), aux_start, table);
+        assert_eq!(circuit.d.len(), 3);
+
+        let mut rng = StdRng::seed_from_u64(57);
+        let gamma = Fr::rand(&mut rng);
+        let z = program.gen_z(conv_output_start, trace, gamma);
+        let (kzg_pp, kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
+        let (pk, vk) = Preprocessor::build(kzg_pp, kzg_vp, circuit);
+        let prover = Prover::new(pk);
+        let mut ro = RandomOracle::new(&mut rng);
+        let proof = prover.prove(z, gamma, &mut ro);
+        Verifier::new(vk).verify(proof, gamma, &mut ro);
+    }
+
+    #[test]
     fn wrong_weights_commit_rejects() {
         let (program, input, circuit, output_start) = sample_fixture();
         let mut rng = StdRng::seed_from_u64(31);

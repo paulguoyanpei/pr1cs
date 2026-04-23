@@ -74,6 +74,30 @@ impl<F: Field> MlPoly<F> {
         res
     }
 
+    /// MLE of the length-`n` all-ones vector (zero-padded to 2^point.len()) at `point`.
+    /// Equivalently, sum_{i=0}^{n-1} eq(bin(i), point), computed in O(point.len()).
+    pub fn eval_ones_pref(point: &[F], n: usize) -> F {
+        let m = point.len();
+        let one = F::one();
+        if n == 0 {
+            return F::ZERO;
+        }
+        if n >= (1usize << m) {
+            return one;
+        }
+        let mut result = F::ZERO;
+        let mut carry = one;
+        for bit in (0..m).rev() {
+            if (n >> bit) & 1 == 1 {
+                result += carry * (one - point[bit]);
+                carry *= point[bit];
+            } else {
+                carry *= one - point[bit];
+            }
+        }
+        result
+    }
+
     pub fn eval_eq_pref(r: &Vec<F>, point: &Vec<F>, n: usize) -> F {
         let k = r.len();
         let m = point.len();
