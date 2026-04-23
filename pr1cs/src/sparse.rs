@@ -1,6 +1,7 @@
 use ark_ec::pairing::Pairing;
 use ark_ff::{Field, One, PrimeField, Zero};
 use rayon::prelude::*;
+use std::{env, time::Instant};
 
 use util::{
     kzg::{Mkzg, MkzgCommit, MkzgProof, MkzgProveParams, MkzgVerParams, SumcheckProof},
@@ -19,6 +20,41 @@ pub const NUM_CLAIMS: usize = 10;
 pub const NUM_SUPERGROUPS: usize = 1;
 
 const SUF_CLAIMS: &[usize] = &[0, 1, 2, 3, 4];
+
+struct DebugTimer {
+    name: &'static str,
+    enabled: bool,
+    start: Instant,
+    last: Instant,
+}
+
+impl DebugTimer {
+    fn new(name: &'static str) -> Self {
+        let enabled = env::var_os("PR1CS_DEBUG_SPARSE_OPEN").is_some();
+        let now = Instant::now();
+        DebugTimer {
+            name,
+            enabled,
+            start: now,
+            last: now,
+        }
+    }
+
+    fn log(&mut self, label: &str) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        eprintln!(
+            "[debug][{}] {}: {:?} (total {:?})",
+            self.name,
+            label,
+            now.duration_since(self.last),
+            now.duration_since(self.start)
+        );
+        self.last = now;
+    }
+}
 
 #[derive(Clone)]
 pub struct SparseSupergroup<F: PrimeField> {
@@ -1348,6 +1384,7 @@ fn prove_b_pre<E: Pairing>(
     ro: &mut RandomOracle<E::ScalarField>,
     acc: &mut ProverAcc<E::ScalarField>,
 ) {
+    let mut timer = DebugTimer::new("sparse_open::b_pre");
     assert_eq!(row_eq_point.len(), group.log_row);
     assert!(col_eq_point.len() >= group.split_lo);
     let (point_lo, point_hi) = split_point(col_eq_point, group.split_lo, group.log_col_hi);
@@ -1366,6 +1403,7 @@ fn prove_b_pre<E: Pairing>(
         }
         out
     };
+    timer.log("build eq tables");
 
     let e_row: Vec<E::ScalarField> = group.row_idx.par_iter().map(|&i| row_eq[i]).collect();
     let e_col_lo: Vec<E::ScalarField> =
@@ -1373,7 +1411,10 @@ fn prove_b_pre<E: Pairing>(
     let e_col_hi: Vec<E::ScalarField> =
         group.col_hi_idx.par_iter().map(|&i| col_hi_eq[i]).collect();
     let e_gamma: Vec<E::ScalarField> = group.pow_idx.par_iter().map(|&i| gamma_table[i]).collect();
+    timer.log("materialize table reads");
 
+    println!("{} {} {} {} {} {}", file!(), line!(), e_row.len(), e_col_lo.len(), e_col_hi.len(), e_gamma.len());
+    println!("{}", kzg_pp.0.len());
     let e_row_poly = MlPoly::new(e_row.clone());
     let e_col_lo_poly = MlPoly::new(e_col_lo.clone());
     let e_col_hi_poly = MlPoly::new(e_col_hi.clone());
@@ -1387,11 +1428,13 @@ fn prove_b_pre<E: Pairing>(
         proof.push_u(c.0.len());
         proof.push_gs(&c.0);
     }
+    timer.log("commit read polys");
     let direct_claim: E::ScalarField = (0..group.len)
         .into_par_iter()
         .map(|i| e_row[i] * e_col_lo[i] * e_col_hi[i] * e_gamma[i] * group.val.0[i])
         .sum();
     assert_eq!(direct_claim, claim);
+    timer.log("compute direct claim");
 
     let point_main = sumcheck_main5::<E>(
         e_row.clone(),
@@ -1402,6 +1445,7 @@ fn prove_b_pre<E: Pairing>(
         proof,
         ro,
     );
+    timer.log("main sumcheck");
     acc.push(e_row_poly.clone(), point_main.clone());
     acc.push(e_col_lo_poly.clone(), point_main.clone());
     acc.push(e_col_hi_poly.clone(), point_main.clone());
@@ -1414,6 +1458,7 @@ fn prove_b_pre<E: Pairing>(
     let beta_pow = ro.next_field();
     let alpha = ro.next_field();
     let rho = ro.next_field();
+    timer.log("sample logup challenges");
 
     let ele_row: Vec<E::ScalarField> = (0..group.len)
         .into_par_iter()
@@ -1431,6 +1476,7 @@ fn prove_b_pre<E: Pairing>(
         .into_par_iter()
         .map(|k| group.pow.0[k] + beta_pow * e_gamma[k])
         .collect();
+    timer.log("build left logup inputs");
 
     let mut ei_row: Vec<E::ScalarField> = ele_row.iter().map(|&x| x + alpha).collect();
     batch_inverse(&mut ei_row);
@@ -1440,6 +1486,7 @@ fn prove_b_pre<E: Pairing>(
     batch_inverse(&mut ei_col_hi);
     let mut ei_pow: Vec<E::ScalarField> = ele_pow.iter().map(|&x| x + alpha).collect();
     batch_inverse(&mut ei_pow);
+    timer.log("batch invert left inputs");
 
     let ei_row_poly = MlPoly::new(ei_row.clone());
     let ei_col_lo_poly = MlPoly::new(ei_col_lo.clone());
@@ -1454,12 +1501,14 @@ fn prove_b_pre<E: Pairing>(
         proof.push_u(c.0.len());
         proof.push_gs(&c.0);
     }
+    timer.log("commit inverse polys");
 
     let s_row: E::ScalarField = ei_row.iter().copied().sum();
     let s_col_lo: E::ScalarField = ei_col_lo.iter().copied().sum();
     let s_col_hi: E::ScalarField = ei_col_hi.iter().copied().sum();
     let s_pow: E::ScalarField = ei_pow.iter().copied().sum();
     proof.push_f(&[s_row, s_col_lo, s_col_hi, s_pow]);
+    timer.log("accumulate inverse sums");
 
     let point_l = combined_logup_left4::<E>(
         ele_row,
@@ -1475,6 +1524,7 @@ fn prove_b_pre<E: Pairing>(
         proof,
         ro,
     );
+    timer.log("left logup sumcheck");
 
     let row_idx_v = group.row.clone().eval(&point_l);
     let col_lo_idx_v = group.col_lo.clone().eval(&point_l);
@@ -1494,6 +1544,7 @@ fn prove_b_pre<E: Pairing>(
         e_col_hi_v_l,
         e_gamma_v_l,
     ]);
+    timer.log("evaluate left point");
 
     acc.push(group.row.clone(), point_l.clone());
     acc.push(group.col_lo.clone(), point_l.clone());
@@ -1507,6 +1558,7 @@ fn prove_b_pre<E: Pairing>(
     acc.push(ei_col_lo_poly, point_l.clone());
     acc.push(ei_col_hi_poly, point_l.clone());
     acc.push(ei_pow_poly, point_l);
+    timer.log("queue left batch opens");
 
     let build_right = |table: &[E::ScalarField],
                        beta: E::ScalarField|
@@ -1529,6 +1581,7 @@ fn prove_b_pre<E: Pairing>(
         .par_iter()
         .map(|(t, b, _)| build_right(t, *b))
         .collect();
+    timer.log("build right logup tables");
     let tab_inv_polys: Vec<MlPoly<E::ScalarField>> = right_tabs
         .iter()
         .map(|(_, ti)| MlPoly::new(ti.clone()))
@@ -1541,6 +1594,7 @@ fn prove_b_pre<E: Pairing>(
         proof.push_u(c.0.len());
         proof.push_gs(&c.0);
     }
+    timer.log("commit right inverse polys");
     for ((tab, tab_inv), (tip, (_, _, count_poly))) in right_tabs
         .into_iter()
         .zip(tab_inv_polys.into_iter().zip(right_inputs.iter()))
@@ -1550,6 +1604,7 @@ fn prove_b_pre<E: Pairing>(
         acc.push(tip, point_r.clone());
         acc.push((*count_poly).clone(), point_r);
     }
+    timer.log("right logup sumchecks");
 }
 
 pub fn sparse_open<E: Pairing>(
@@ -1564,6 +1619,7 @@ pub fn sparse_open<E: Pairing>(
     proof: &mut Proof<E>,
     ro: &mut RandomOracle<E::ScalarField>,
 ) -> SparseEvals<E::ScalarField> {
+    let mut timer = DebugTimer::new("sparse_open");
     // Compute the 10 claimed MLE values directly.
     let row_eq_abc = MlPoly::new_eq(&point_abc.to_vec()).0;
     let row_eq_de = MlPoly::new_eq(&point_de.to_vec()).0;
@@ -1593,9 +1649,11 @@ pub fn sparse_open<E: Pairing>(
         d_pre: circuit.d.mle(&row_eq_de, &col_eq_pre, 0, wei_len, gamma),
         e_pre: circuit.e.mle(&row_eq_de, &col_eq_pre, 0, wei_len, gamma),
     };
+    timer.log("compute direct evals");
 
     // Push the 10 claimed values first.
     proof.push_f(&sparse_evals.as_array());
+    timer.log("push direct evals");
 
     let claim_array = sparse_evals.as_array();
     let mut acc = ProverAcc::<E::ScalarField>::new();
@@ -1605,6 +1663,7 @@ pub fn sparse_open<E: Pairing>(
     lasso_prove_supergroup::<E>(
         kzg_pp, sg, point_abc, point_de, point_suf, gamma, &claims, proof, ro, &mut acc,
     );
+    timer.log("prove suffix supergroup");
     prove_b_pre::<E>(
         kzg_pp,
         &polys.b_pre,
@@ -1616,12 +1675,14 @@ pub fn sparse_open<E: Pairing>(
         ro,
         &mut acc,
     );
+    timer.log("prove b_pre");
 
     let (kzg_proof, sumcheck_proof) = Mkzg::<E>::batch_open(kzg_pp, &acc.polys, &acc.points, ro);
     proof.push_u(kzg_proof.0.len());
     proof.push_gs(&kzg_proof.0);
     proof.push_u(sumcheck_proof.0.len());
     proof.push_f(&sumcheck_proof.0);
+    timer.log("final batch open");
 
     sparse_evals
 }

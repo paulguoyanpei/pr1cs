@@ -6,7 +6,7 @@ use pr1cs::verifier::Verifier;
 use pr1cs::{circuit::LookupType, instruction::Instruction, program::Program};
 use rand::thread_rng;
 use std::cmp;
-use util::kzg::Mkzg;
+use util::kzg::{LOG_CHUNK_SIZE, Mkzg};
 use util::util::RandomOracle;
 
 const LAYER_COUNT: usize = 16;
@@ -93,7 +93,7 @@ fn main() {
     circuit.check(z.clone(), gamma);
 
     let mut rng = thread_rng();
-    let (kzg_pp, kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
+    let (kzg_pp, kzg_vp) = Mkzg::<Bn254>::gen_srs(LOG_CHUNK_SIZE, &mut rng);
     let (pk, vk) = Preprocessor::build(kzg_pp, kzg_vp, circuit);
     let prover = Prover::new(pk);
     let mut ro = RandomOracle::new(&mut rng);

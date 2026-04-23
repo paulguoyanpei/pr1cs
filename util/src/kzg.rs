@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 
 use crate::{poly::MlPoly, util::RandomOracle};
 
-pub const LOG_CHUNK_SIZE: usize = 10;
+pub const LOG_CHUNK_SIZE: usize = 18;
 pub struct Mkzg<E: Pairing>(PhantomData<E>);
 #[derive(Debug, Clone)]
 pub struct MkzgCommit<E: Pairing>(pub Vec<E::G1>);
@@ -32,7 +32,7 @@ impl<E: Pairing> MkzgVerParams<E> {
 }
 
 #[derive(Debug, Clone)]
-pub struct MkzgProveParams<E: Pairing>(Vec<E::G1Affine>);
+pub struct MkzgProveParams<E: Pairing>(pub Vec<E::G1Affine>);
 impl<E: Pairing> MkzgProveParams<E> {
     pub fn trim(&self, log_len: usize) -> Self {
         let mut params = self.0.clone();

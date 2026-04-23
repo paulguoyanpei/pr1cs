@@ -1,6 +1,6 @@
 use ark_ec::pairing::Pairing;
 use ark_ff::{Field, PrimeField, UniformRand};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 pub struct Proof<E: Pairing> {
     u: Vec<usize>,

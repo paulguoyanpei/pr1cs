@@ -11,7 +11,7 @@ use util::{
 
 fn main() {
     let mut rng = thread_rng();
-    let (pp, vp) = Mkzg::<Bn254>::gen_srs(18, &mut rng);
+    let (pp, vp) = Mkzg::<Bn254>::gen_srs(LOG_CHUNK_SIZE, &mut rng);
     bench_kzg(&pp, &vp, 20);
 }
 
