@@ -87,7 +87,7 @@ mod tests {
 
     use ark_bn254::{Bn254, Fr};
     use ark_ff::UniformRand;
-    use rand::{rngs::StdRng, SeedableRng};
+    use rand::{SeedableRng, rngs::StdRng};
     use util::{kzg::Mkzg, poly::MlPoly, util::RandomOracle};
 
     use super::Preprocessor;
@@ -369,10 +369,9 @@ mod tests {
                 polys.supergroups[0].matrix_lens
             );
             assert_eq!(polys.b_pre.len, commits.b_pre.len);
-            assert_eq!(polys.b_pre.log_col_lo, commits.b_pre.log_col_lo);
-            assert_eq!(polys.b_pre.log_col_hi, commits.b_pre.log_col_hi);
-            assert!(polys.b_pre.count_col_lo.0.len() < circuit.weight_len);
-            assert!(polys.b_pre.count_col_hi.0.len() < circuit.weight_len);
+            assert_eq!(polys.b_pre.log_col, commits.b_pre.log_col);
+            assert_eq!(polys.b_pre.count_col.0.len(), 1 << polys.b_pre.log_col);
+            assert!(polys.b_pre.count_col.0.len() >= circuit.weight_len);
         }
     }
 

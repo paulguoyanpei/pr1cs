@@ -6,7 +6,7 @@ use pr1cs::verifier::Verifier;
 use pr1cs::{circuit::LookupType, instruction::Instruction, program::Program};
 use rand::thread_rng;
 use std::cmp;
-use util::kzg::{LOG_CHUNK_SIZE, Mkzg};
+use util::kzg::{Mkzg, LOG_CHUNK_SIZE};
 use util::util::RandomOracle;
 
 const LAYER_COUNT: usize = 16;

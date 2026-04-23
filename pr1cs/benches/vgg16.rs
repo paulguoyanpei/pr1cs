@@ -10,7 +10,7 @@ use pr1cs::prover::Prover;
 use pr1cs::verifier::Verifier;
 use pr1cs::{circuit::LookupType, instruction::Instruction, program::Program};
 use rand::thread_rng;
-use util::kzg::{LOG_CHUNK_SIZE, Mkzg};
+use util::kzg::{Mkzg, LOG_CHUNK_SIZE};
 use util::util::RandomOracle;
 
 const KERNEL: usize = 3; // 3x3 conv

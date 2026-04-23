@@ -6,7 +6,7 @@ use std::{env, time::Instant};
 use util::{
     kzg::{Mkzg, MkzgCommit, MkzgProof, MkzgProveParams, MkzgVerParams, SumcheckProof},
     poly::MlPoly,
-    util::{batch_inverse, Proof, RandomOracle},
+    util::{Proof, RandomOracle, batch_inverse},
 };
 
 use crate::circuit::{Circuit, SparseMatrix};
@@ -15,7 +15,7 @@ use crate::circuit::{Circuit, SparseMatrix};
 //   a_suf, b_suf, c_suf, d_suf, e_suf, a_pre, b_pre, c_pre, d_pre, e_pre.
 //
 // The sparse proof proves the five suffix claims as one batch and proves b_pre
-// as a separate split-column opening. The remaining prefix claims must be zero.
+// as a separate opening. The remaining prefix claims must be zero.
 pub const NUM_CLAIMS: usize = 10;
 pub const NUM_SUPERGROUPS: usize = 1;
 
@@ -80,22 +80,17 @@ pub struct SparseSupergroup<F: PrimeField> {
 pub struct BPreGroup<F: PrimeField> {
     pub len: usize,
     pub log_row: usize,
-    pub log_col_lo: usize,
-    pub log_col_hi: usize,
+    pub log_col: usize,
     pub log_pow: usize,
-    pub split_lo: usize,
     pub row: MlPoly<F>,
-    pub col_lo: MlPoly<F>,
-    pub col_hi: MlPoly<F>,
+    pub col: MlPoly<F>,
     pub val: MlPoly<F>,
     pub pow: MlPoly<F>,
     pub count_row: MlPoly<F>,
-    pub count_col_lo: MlPoly<F>,
-    pub count_col_hi: MlPoly<F>,
+    pub count_col: MlPoly<F>,
     pub count_pow: MlPoly<F>,
     pub row_idx: Vec<usize>,
-    pub col_lo_idx: Vec<usize>,
-    pub col_hi_idx: Vec<usize>,
+    pub col_idx: Vec<usize>,
     pub pow_idx: Vec<usize>,
 }
 
@@ -125,18 +120,14 @@ pub struct SparseSupergroupCommit<E: Pairing> {
 pub struct BPreCommit<E: Pairing> {
     pub len: usize,
     pub log_row: usize,
-    pub log_col_lo: usize,
-    pub log_col_hi: usize,
+    pub log_col: usize,
     pub log_pow: usize,
-    pub split_lo: usize,
     pub row: MkzgCommit<E>,
-    pub col_lo: MkzgCommit<E>,
-    pub col_hi: MkzgCommit<E>,
+    pub col: MkzgCommit<E>,
     pub val: MkzgCommit<E>,
     pub pow: MkzgCommit<E>,
     pub count_row: MkzgCommit<E>,
-    pub count_col_lo: MkzgCommit<E>,
-    pub count_col_hi: MkzgCommit<E>,
+    pub count_col: MkzgCommit<E>,
     pub count_pow: MkzgCommit<E>,
 }
 
@@ -295,13 +286,6 @@ fn collect_entries<F: PrimeField>(
     entries
 }
 
-fn split_point<F: Field>(point: &[F], split_lo: usize, log_hi: usize) -> (Vec<F>, Vec<F>) {
-    let lo = point[..split_lo].to_vec();
-    let mut hi = point[split_lo..].to_vec();
-    hi.resize(log_hi, F::zero());
-    (lo, hi)
-}
-
 fn build_supergroup<F: PrimeField>(
     per_matrix: Vec<Vec<(usize, usize, F, usize)>>,
     row_base_log: usize,
@@ -371,14 +355,9 @@ fn build_supergroup<F: PrimeField>(
 fn build_b_pre_group<F: PrimeField>(
     entries: Vec<(usize, usize, F, usize)>,
     log_row: usize,
-    log_col_pre: usize,
+    log_col: usize,
     log_pow: usize,
 ) -> BPreGroup<F> {
-    let split_lo = (log_col_pre / 2).max(1);
-    let log_col_hi = (log_col_pre - split_lo).max(1);
-    let log_col_lo = split_lo;
-    let lo_mask = (1usize << split_lo) - 1;
-
     let mut entries = entries;
     if entries.is_empty() {
         entries.push((0, 0, F::zero(), 0));
@@ -386,56 +365,43 @@ fn build_b_pre_group<F: PrimeField>(
 
     let len = entries.len();
     let mut row = Vec::with_capacity(len);
-    let mut col_lo = Vec::with_capacity(len);
-    let mut col_hi = Vec::with_capacity(len);
+    let mut col = Vec::with_capacity(len);
     let mut val = Vec::with_capacity(len);
     let mut pow = Vec::with_capacity(len);
     let mut row_idx = Vec::with_capacity(len);
-    let mut col_lo_idx = Vec::with_capacity(len);
-    let mut col_hi_idx = Vec::with_capacity(len);
+    let mut col_idx = Vec::with_capacity(len);
     let mut pow_idx = Vec::with_capacity(len);
     let mut count_row = vec![F::zero(); 1 << log_row];
-    let mut count_col_lo = vec![F::zero(); 1 << log_col_lo];
-    let mut count_col_hi = vec![F::zero(); 1 << log_col_hi];
+    let mut count_col = vec![F::zero(); 1 << log_col];
     let mut count_pow = vec![F::zero(); 1 << log_pow];
 
     for (r, c, v, p) in entries {
-        let lo = c & lo_mask;
-        let hi = c >> split_lo;
         row.push(F::from(r as u64));
-        col_lo.push(F::from(lo as u64));
-        col_hi.push(F::from(hi as u64));
+        col.push(F::from(c as u64));
         val.push(v);
         pow.push(F::from(p as u64));
         row_idx.push(r);
-        col_lo_idx.push(lo);
-        col_hi_idx.push(hi);
+        col_idx.push(c);
         pow_idx.push(p);
         count_row[r] += F::one();
-        count_col_lo[lo] += F::one();
-        count_col_hi[hi] += F::one();
+        count_col[c] += F::one();
         count_pow[p] += F::one();
     }
 
     BPreGroup {
         len,
         log_row,
-        log_col_lo,
-        log_col_hi,
+        log_col,
         log_pow,
-        split_lo,
         row: MlPoly::new(row),
-        col_lo: MlPoly::new(col_lo),
-        col_hi: MlPoly::new(col_hi),
+        col: MlPoly::new(col),
         val: MlPoly::new(val),
         pow: MlPoly::new(pow),
         count_row: MlPoly::new(count_row),
-        count_col_lo: MlPoly::new(count_col_lo),
-        count_col_hi: MlPoly::new(count_col_hi),
+        count_col: MlPoly::new(count_col),
         count_pow: MlPoly::new(count_pow),
         row_idx,
-        col_lo_idx,
-        col_hi_idx,
+        col_idx,
         pow_idx,
     }
 }
@@ -502,18 +468,14 @@ pub fn sparse_commit<E: Pairing>(
     let b_pre_commit = BPreCommit {
         len: b_pre.len,
         log_row: b_pre.log_row,
-        log_col_lo: b_pre.log_col_lo,
-        log_col_hi: b_pre.log_col_hi,
+        log_col: b_pre.log_col,
         log_pow: b_pre.log_pow,
-        split_lo: b_pre.split_lo,
         row: Mkzg::<E>::commit(kzg_pp, &b_pre.row),
-        col_lo: Mkzg::<E>::commit(kzg_pp, &b_pre.col_lo),
-        col_hi: Mkzg::<E>::commit(kzg_pp, &b_pre.col_hi),
+        col: Mkzg::<E>::commit(kzg_pp, &b_pre.col),
         val: Mkzg::<E>::commit(kzg_pp, &b_pre.val),
         pow: Mkzg::<E>::commit(kzg_pp, &b_pre.pow),
         count_row: Mkzg::<E>::commit(kzg_pp, &b_pre.count_row),
-        count_col_lo: Mkzg::<E>::commit(kzg_pp, &b_pre.count_col_lo),
-        count_col_hi: Mkzg::<E>::commit(kzg_pp, &b_pre.count_col_hi),
+        count_col: Mkzg::<E>::commit(kzg_pp, &b_pre.count_col),
         count_pow: Mkzg::<E>::commit(kzg_pp, &b_pre.count_pow),
     };
 
@@ -591,76 +553,6 @@ fn sumcheck_main4<E: Pairing>(
     }
     assert_eq!(a.len(), 1);
     proof.push_f(&[a[0], b[0], c[0], d[0]]);
-    new_point
-}
-
-// Degree-5 product sumcheck:
-//     sum_t a[t] * b[t] * c[t] * d[t] * e[t].
-fn sumcheck_main5<E: Pairing>(
-    mut a: Vec<E::ScalarField>,
-    mut b: Vec<E::ScalarField>,
-    mut c: Vec<E::ScalarField>,
-    mut d: Vec<E::ScalarField>,
-    mut e: Vec<E::ScalarField>,
-    proof: &mut Proof<E>,
-    ro: &mut RandomOracle<E::ScalarField>,
-) -> Vec<E::ScalarField> {
-    assert_eq!(a.len(), b.len());
-    assert_eq!(a.len(), c.len());
-    assert_eq!(a.len(), d.len());
-    assert_eq!(a.len(), e.len());
-    proof.push_u(a.len());
-    let log_len = log2_ceil(a.len());
-    let mut new_point = vec![];
-    for _ in 0..log_len {
-        if a.len() % 2 == 1 {
-            a.push(E::ScalarField::zero());
-            b.push(E::ScalarField::zero());
-            c.push(E::ScalarField::zero());
-            d.push(E::ScalarField::zero());
-            e.push(E::ScalarField::zero());
-        }
-        let m = a.len();
-        let mut sums = [E::ScalarField::zero(); 6];
-        for j in (0..m).step_by(2) {
-            let da = a[j + 1] - a[j];
-            let db = b[j + 1] - b[j];
-            let dc = c[j + 1] - c[j];
-            let dd = d[j + 1] - d[j];
-            let de = e[j + 1] - e[j];
-            sums[0] += a[j] * b[j] * c[j] * d[j] * e[j];
-            sums[1] += a[j + 1] * b[j + 1] * c[j + 1] * d[j + 1] * e[j + 1];
-            let mut av = a[j + 1];
-            let mut bv = b[j + 1];
-            let mut cv = c[j + 1];
-            let mut dv = d[j + 1];
-            let mut ev = e[j + 1];
-            for k in 2..=5 {
-                av += da;
-                bv += db;
-                cv += dc;
-                dv += dd;
-                ev += de;
-                sums[k] += av * bv * cv * dv * ev;
-            }
-        }
-        proof.push_f(&sums);
-        let challenge = ro.next_field();
-        new_point.push(challenge);
-        for i in 0..m / 2 {
-            a[i] = a[i * 2] + (a[i * 2 + 1] - a[i * 2]) * challenge;
-            b[i] = b[i * 2] + (b[i * 2 + 1] - b[i * 2]) * challenge;
-            c[i] = c[i * 2] + (c[i * 2 + 1] - c[i * 2]) * challenge;
-            d[i] = d[i * 2] + (d[i * 2 + 1] - d[i * 2]) * challenge;
-            e[i] = e[i * 2] + (e[i * 2 + 1] - e[i * 2]) * challenge;
-        }
-        a.truncate(m / 2);
-        b.truncate(m / 2);
-        c.truncate(m / 2);
-        d.truncate(m / 2);
-        e.truncate(m / 2);
-    }
-    proof.push_f(&[a[0], b[0], c[0], d[0], e[0]]);
     new_point
 }
 
@@ -828,142 +720,6 @@ fn combined_logup_left<E: Pairing>(
     }
     assert_eq!(er.len(), 1);
     proof.push_f(&[er[0], eir[0], ec[0], eic[0], eg[0], eig[0]]);
-    new_point
-}
-
-#[allow(clippy::too_many_arguments)]
-fn combined_logup_left4<E: Pairing>(
-    mut e0: Vec<E::ScalarField>,
-    mut ei0: Vec<E::ScalarField>,
-    mut e1: Vec<E::ScalarField>,
-    mut ei1: Vec<E::ScalarField>,
-    mut e2: Vec<E::ScalarField>,
-    mut ei2: Vec<E::ScalarField>,
-    mut e3: Vec<E::ScalarField>,
-    mut ei3: Vec<E::ScalarField>,
-    alpha: E::ScalarField,
-    rho: E::ScalarField,
-    proof: &mut Proof<E>,
-    ro: &mut RandomOracle<E::ScalarField>,
-) -> Vec<E::ScalarField> {
-    let log_len = log2_ceil(e0.len());
-    e0.iter_mut().for_each(|x| *x += alpha);
-    e1.iter_mut().for_each(|x| *x += alpha);
-    e2.iter_mut().for_each(|x| *x += alpha);
-    e3.iter_mut().for_each(|x| *x += alpha);
-    proof.push_u(e0.len());
-    let mut eq = MlPoly::new_eq(&ro.next_n_fields(log_len)).0;
-    eq.truncate(e0.len());
-    let r_sum = ro.next_field();
-    let rho2 = rho * rho;
-    let rho3 = rho2 * rho;
-    let one = E::ScalarField::one();
-
-    let contrib = |e0: E::ScalarField,
-                   ei0: E::ScalarField,
-                   e1: E::ScalarField,
-                   ei1: E::ScalarField,
-                   e2: E::ScalarField,
-                   ei2: E::ScalarField,
-                   e3: E::ScalarField,
-                   ei3: E::ScalarField,
-                   eq: E::ScalarField|
-     -> E::ScalarField {
-        let prod0 = e0 * ei0 - one;
-        let prod1 = e1 * ei1 - one;
-        let prod2 = e2 * ei2 - one;
-        let prod3 = e3 * ei3 - one;
-        let inv_comb = ei0 + rho * ei1 + rho2 * ei2 + rho3 * ei3;
-        (prod0 + rho * prod1 + rho2 * prod2 + rho3 * prod3) * eq + r_sum * inv_comb
-    };
-
-    let mut new_point = vec![];
-    for _ in 0..log_len {
-        if e0.len() % 2 == 1 {
-            e0.push(E::ScalarField::zero());
-            ei0.push(E::ScalarField::zero());
-            e1.push(E::ScalarField::zero());
-            ei1.push(E::ScalarField::zero());
-            e2.push(E::ScalarField::zero());
-            ei2.push(E::ScalarField::zero());
-            e3.push(E::ScalarField::zero());
-            ei3.push(E::ScalarField::zero());
-            eq.push(E::ScalarField::zero());
-        }
-        let m = e0.len();
-        let mut sums = [E::ScalarField::zero(); 4];
-        for j in (0..m).step_by(2) {
-            let de0 = e0[j + 1] - e0[j];
-            let dei0 = ei0[j + 1] - ei0[j];
-            let de1 = e1[j + 1] - e1[j];
-            let dei1 = ei1[j + 1] - ei1[j];
-            let de2 = e2[j + 1] - e2[j];
-            let dei2 = ei2[j + 1] - ei2[j];
-            let de3 = e3[j + 1] - e3[j];
-            let dei3 = ei3[j + 1] - ei3[j];
-            let deq = eq[j + 1] - eq[j];
-
-            sums[0] += contrib(
-                e0[j], ei0[j], e1[j], ei1[j], e2[j], ei2[j], e3[j], ei3[j], eq[j],
-            );
-            sums[1] += contrib(
-                e0[j + 1],
-                ei0[j + 1],
-                e1[j + 1],
-                ei1[j + 1],
-                e2[j + 1],
-                ei2[j + 1],
-                e3[j + 1],
-                ei3[j + 1],
-                eq[j + 1],
-            );
-            let mut ve0 = e0[j + 1];
-            let mut vei0 = ei0[j + 1];
-            let mut ve1 = e1[j + 1];
-            let mut vei1 = ei1[j + 1];
-            let mut ve2 = e2[j + 1];
-            let mut vei2 = ei2[j + 1];
-            let mut ve3 = e3[j + 1];
-            let mut vei3 = ei3[j + 1];
-            let mut veq = eq[j + 1];
-            for k in 2..=3 {
-                ve0 += de0;
-                vei0 += dei0;
-                ve1 += de1;
-                vei1 += dei1;
-                ve2 += de2;
-                vei2 += dei2;
-                ve3 += de3;
-                vei3 += dei3;
-                veq += deq;
-                sums[k] += contrib(ve0, vei0, ve1, vei1, ve2, vei2, ve3, vei3, veq);
-            }
-        }
-        proof.push_f(&sums);
-        let ch = ro.next_field();
-        new_point.push(ch);
-        for i in 0..m / 2 {
-            e0[i] = e0[i * 2] + (e0[i * 2 + 1] - e0[i * 2]) * ch;
-            ei0[i] = ei0[i * 2] + (ei0[i * 2 + 1] - ei0[i * 2]) * ch;
-            e1[i] = e1[i * 2] + (e1[i * 2 + 1] - e1[i * 2]) * ch;
-            ei1[i] = ei1[i * 2] + (ei1[i * 2 + 1] - ei1[i * 2]) * ch;
-            e2[i] = e2[i * 2] + (e2[i * 2 + 1] - e2[i * 2]) * ch;
-            ei2[i] = ei2[i * 2] + (ei2[i * 2 + 1] - ei2[i * 2]) * ch;
-            e3[i] = e3[i * 2] + (e3[i * 2 + 1] - e3[i * 2]) * ch;
-            ei3[i] = ei3[i * 2] + (ei3[i * 2 + 1] - ei3[i * 2]) * ch;
-            eq[i] = eq[i * 2] + (eq[i * 2 + 1] - eq[i * 2]) * ch;
-        }
-        e0.truncate(m / 2);
-        ei0.truncate(m / 2);
-        e1.truncate(m / 2);
-        ei1.truncate(m / 2);
-        e2.truncate(m / 2);
-        ei2.truncate(m / 2);
-        e3.truncate(m / 2);
-        ei3.truncate(m / 2);
-        eq.truncate(m / 2);
-    }
-    proof.push_f(&[e0[0], ei0[0], e1[0], ei1[0], e2[0], ei2[0], e3[0], ei3[0]]);
     new_point
 }
 
@@ -1386,14 +1142,10 @@ fn prove_b_pre<E: Pairing>(
 ) {
     let mut timer = DebugTimer::new("sparse_open::b_pre");
     assert_eq!(row_eq_point.len(), group.log_row);
-    assert!(col_eq_point.len() >= group.split_lo);
-    let (point_lo, point_hi) = split_point(col_eq_point, group.split_lo, group.log_col_hi);
-    assert_eq!(point_lo.len(), group.log_col_lo);
-    assert_eq!(point_hi.len(), group.log_col_hi);
+    assert_eq!(col_eq_point.len(), group.log_col);
 
     let row_eq = MlPoly::new_eq(&row_eq_point.to_vec()).0;
-    let col_lo_eq = MlPoly::new_eq(&point_lo).0;
-    let col_hi_eq = MlPoly::new_eq(&point_hi).0;
+    let col_eq = MlPoly::new_eq(&col_eq_point.to_vec()).0;
     let gamma_table: Vec<E::ScalarField> = {
         let mut out = Vec::with_capacity(1usize << group.log_pow);
         let mut cur = E::ScalarField::one();
@@ -1406,24 +1158,17 @@ fn prove_b_pre<E: Pairing>(
     timer.log("build eq tables");
 
     let e_row: Vec<E::ScalarField> = group.row_idx.par_iter().map(|&i| row_eq[i]).collect();
-    let e_col_lo: Vec<E::ScalarField> =
-        group.col_lo_idx.par_iter().map(|&i| col_lo_eq[i]).collect();
-    let e_col_hi: Vec<E::ScalarField> =
-        group.col_hi_idx.par_iter().map(|&i| col_hi_eq[i]).collect();
+    let e_col: Vec<E::ScalarField> = group.col_idx.par_iter().map(|&i| col_eq[i]).collect();
     let e_gamma: Vec<E::ScalarField> = group.pow_idx.par_iter().map(|&i| gamma_table[i]).collect();
     timer.log("materialize table reads");
 
-    println!("{} {} {} {} {} {}", file!(), line!(), e_row.len(), e_col_lo.len(), e_col_hi.len(), e_gamma.len());
-    println!("{}", kzg_pp.0.len());
     let e_row_poly = MlPoly::new(e_row.clone());
-    let e_col_lo_poly = MlPoly::new(e_col_lo.clone());
-    let e_col_hi_poly = MlPoly::new(e_col_hi.clone());
+    let e_col_poly = MlPoly::new(e_col.clone());
     let e_gamma_poly = MlPoly::new(e_gamma.clone());
-    let e_commits: Vec<MkzgCommit<E>> =
-        [&e_row_poly, &e_col_lo_poly, &e_col_hi_poly, &e_gamma_poly]
-            .par_iter()
-            .map(|p| Mkzg::<E>::commit(kzg_pp, p))
-            .collect();
+    let e_commits: Vec<MkzgCommit<E>> = [&e_row_poly, &e_col_poly, &e_gamma_poly]
+        .par_iter()
+        .map(|p| Mkzg::<E>::commit(kzg_pp, p))
+        .collect();
     for c in &e_commits {
         proof.push_u(c.0.len());
         proof.push_gs(&c.0);
@@ -1431,15 +1176,14 @@ fn prove_b_pre<E: Pairing>(
     timer.log("commit read polys");
     let direct_claim: E::ScalarField = (0..group.len)
         .into_par_iter()
-        .map(|i| e_row[i] * e_col_lo[i] * e_col_hi[i] * e_gamma[i] * group.val.0[i])
+        .map(|i| e_row[i] * e_col[i] * e_gamma[i] * group.val.0[i])
         .sum();
     assert_eq!(direct_claim, claim);
     timer.log("compute direct claim");
 
-    let point_main = sumcheck_main5::<E>(
+    let point_main = sumcheck_main4::<E>(
         e_row.clone(),
-        e_col_lo.clone(),
-        e_col_hi.clone(),
+        e_col.clone(),
         e_gamma.clone(),
         group.val.0.clone(),
         proof,
@@ -1447,14 +1191,12 @@ fn prove_b_pre<E: Pairing>(
     );
     timer.log("main sumcheck");
     acc.push(e_row_poly.clone(), point_main.clone());
-    acc.push(e_col_lo_poly.clone(), point_main.clone());
-    acc.push(e_col_hi_poly.clone(), point_main.clone());
+    acc.push(e_col_poly.clone(), point_main.clone());
     acc.push(e_gamma_poly.clone(), point_main.clone());
     acc.push(group.val.clone(), point_main);
 
     let beta_row = ro.next_field();
-    let beta_col_lo = ro.next_field();
-    let beta_col_hi = ro.next_field();
+    let beta_col = ro.next_field();
     let beta_pow = ro.next_field();
     let alpha = ro.next_field();
     let rho = ro.next_field();
@@ -1464,13 +1206,9 @@ fn prove_b_pre<E: Pairing>(
         .into_par_iter()
         .map(|k| group.row.0[k] + beta_row * e_row[k])
         .collect();
-    let ele_col_lo: Vec<E::ScalarField> = (0..group.len)
+    let ele_col: Vec<E::ScalarField> = (0..group.len)
         .into_par_iter()
-        .map(|k| group.col_lo.0[k] + beta_col_lo * e_col_lo[k])
-        .collect();
-    let ele_col_hi: Vec<E::ScalarField> = (0..group.len)
-        .into_par_iter()
-        .map(|k| group.col_hi.0[k] + beta_col_hi * e_col_hi[k])
+        .map(|k| group.col.0[k] + beta_col * e_col[k])
         .collect();
     let ele_pow: Vec<E::ScalarField> = (0..group.len)
         .into_par_iter()
@@ -1480,23 +1218,19 @@ fn prove_b_pre<E: Pairing>(
 
     let mut ei_row: Vec<E::ScalarField> = ele_row.iter().map(|&x| x + alpha).collect();
     batch_inverse(&mut ei_row);
-    let mut ei_col_lo: Vec<E::ScalarField> = ele_col_lo.iter().map(|&x| x + alpha).collect();
-    batch_inverse(&mut ei_col_lo);
-    let mut ei_col_hi: Vec<E::ScalarField> = ele_col_hi.iter().map(|&x| x + alpha).collect();
-    batch_inverse(&mut ei_col_hi);
+    let mut ei_col: Vec<E::ScalarField> = ele_col.iter().map(|&x| x + alpha).collect();
+    batch_inverse(&mut ei_col);
     let mut ei_pow: Vec<E::ScalarField> = ele_pow.iter().map(|&x| x + alpha).collect();
     batch_inverse(&mut ei_pow);
     timer.log("batch invert left inputs");
 
     let ei_row_poly = MlPoly::new(ei_row.clone());
-    let ei_col_lo_poly = MlPoly::new(ei_col_lo.clone());
-    let ei_col_hi_poly = MlPoly::new(ei_col_hi.clone());
+    let ei_col_poly = MlPoly::new(ei_col.clone());
     let ei_pow_poly = MlPoly::new(ei_pow.clone());
-    let inv_commits: Vec<MkzgCommit<E>> =
-        [&ei_row_poly, &ei_col_lo_poly, &ei_col_hi_poly, &ei_pow_poly]
-            .par_iter()
-            .map(|p| Mkzg::<E>::commit(kzg_pp, p))
-            .collect();
+    let inv_commits: Vec<MkzgCommit<E>> = [&ei_row_poly, &ei_col_poly, &ei_pow_poly]
+        .par_iter()
+        .map(|p| Mkzg::<E>::commit(kzg_pp, p))
+        .collect();
     for c in &inv_commits {
         proof.push_u(c.0.len());
         proof.push_gs(&c.0);
@@ -1504,19 +1238,16 @@ fn prove_b_pre<E: Pairing>(
     timer.log("commit inverse polys");
 
     let s_row: E::ScalarField = ei_row.iter().copied().sum();
-    let s_col_lo: E::ScalarField = ei_col_lo.iter().copied().sum();
-    let s_col_hi: E::ScalarField = ei_col_hi.iter().copied().sum();
+    let s_col: E::ScalarField = ei_col.iter().copied().sum();
     let s_pow: E::ScalarField = ei_pow.iter().copied().sum();
-    proof.push_f(&[s_row, s_col_lo, s_col_hi, s_pow]);
+    proof.push_f(&[s_row, s_col, s_pow]);
     timer.log("accumulate inverse sums");
 
-    let point_l = combined_logup_left4::<E>(
+    let point_l = combined_logup_left::<E>(
         ele_row,
         ei_row.clone(),
-        ele_col_lo,
-        ei_col_lo.clone(),
-        ele_col_hi,
-        ei_col_hi.clone(),
+        ele_col,
+        ei_col.clone(),
         ele_pow,
         ei_pow.clone(),
         alpha,
@@ -1527,36 +1258,29 @@ fn prove_b_pre<E: Pairing>(
     timer.log("left logup sumcheck");
 
     let row_idx_v = group.row.clone().eval(&point_l);
-    let col_lo_idx_v = group.col_lo.clone().eval(&point_l);
-    let col_hi_idx_v = group.col_hi.clone().eval(&point_l);
+    let col_idx_v = group.col.clone().eval(&point_l);
     let pow_idx_v = group.pow.clone().eval(&point_l);
     let e_row_v_l = e_row_poly.clone().eval(&point_l);
-    let e_col_lo_v_l = e_col_lo_poly.clone().eval(&point_l);
-    let e_col_hi_v_l = e_col_hi_poly.clone().eval(&point_l);
+    let e_col_v_l = e_col_poly.clone().eval(&point_l);
     let e_gamma_v_l = e_gamma_poly.clone().eval(&point_l);
     proof.push_f(&[
         row_idx_v,
-        col_lo_idx_v,
-        col_hi_idx_v,
+        col_idx_v,
         pow_idx_v,
         e_row_v_l,
-        e_col_lo_v_l,
-        e_col_hi_v_l,
+        e_col_v_l,
         e_gamma_v_l,
     ]);
     timer.log("evaluate left point");
 
     acc.push(group.row.clone(), point_l.clone());
-    acc.push(group.col_lo.clone(), point_l.clone());
-    acc.push(group.col_hi.clone(), point_l.clone());
+    acc.push(group.col.clone(), point_l.clone());
     acc.push(group.pow.clone(), point_l.clone());
     acc.push(e_row_poly, point_l.clone());
-    acc.push(e_col_lo_poly, point_l.clone());
-    acc.push(e_col_hi_poly, point_l.clone());
+    acc.push(e_col_poly, point_l.clone());
     acc.push(e_gamma_poly, point_l.clone());
     acc.push(ei_row_poly, point_l.clone());
-    acc.push(ei_col_lo_poly, point_l.clone());
-    acc.push(ei_col_hi_poly, point_l.clone());
+    acc.push(ei_col_poly, point_l.clone());
     acc.push(ei_pow_poly, point_l);
     timer.log("queue left batch opens");
 
@@ -1573,8 +1297,7 @@ fn prove_b_pre<E: Pairing>(
     };
     let right_inputs = vec![
         (&row_eq[..], beta_row, &group.count_row),
-        (&col_lo_eq[..], beta_col_lo, &group.count_col_lo),
-        (&col_hi_eq[..], beta_col_hi, &group.count_col_hi),
+        (&col_eq[..], beta_col, &group.count_col),
         (&gamma_table[..], beta_pow, &group.count_pow),
     ];
     let right_tabs: Vec<(Vec<E::ScalarField>, Vec<E::ScalarField>)> = right_inputs
@@ -1879,54 +1602,42 @@ fn verify_b_pre<E: Pairing>(
     acc: &mut VerifierAcc<E>,
 ) {
     assert_eq!(row_eq_point.len(), commit.log_row);
-    assert!(col_eq_point.len() >= commit.split_lo);
-    let (point_lo, point_hi) = split_point(col_eq_point, commit.split_lo, commit.log_col_hi);
-    assert_eq!(point_lo.len(), commit.log_col_lo);
-    assert_eq!(point_hi.len(), commit.log_col_hi);
+    assert_eq!(col_eq_point.len(), commit.log_col);
 
     let read_commit = |proof: &mut Proof<E>| {
         let l = proof.next_u();
         MkzgCommit(proof.next_n_gs(l))
     };
     let e_row_commit = read_commit(proof);
-    let e_col_lo_commit = read_commit(proof);
-    let e_col_hi_commit = read_commit(proof);
+    let e_col_commit = read_commit(proof);
     let e_gamma_commit = read_commit(proof);
 
     let len_main = proof.next_u();
     let nv_main = log2_ceil(len_main);
-    let (point_main, y_main) = verifier_sumcheck::<E>(claim, nv_main, 5, proof, ro);
+    let (point_main, y_main) = verifier_sumcheck::<E>(claim, nv_main, 4, proof, ro);
     let e_row_v = proof.next_f();
-    let e_col_lo_v = proof.next_f();
-    let e_col_hi_v = proof.next_f();
+    let e_col_v = proof.next_f();
     let e_gamma_v = proof.next_f();
     let val_v = proof.next_f();
-    assert_eq!(
-        y_main,
-        e_row_v * e_col_lo_v * e_col_hi_v * e_gamma_v * val_v
-    );
+    assert_eq!(y_main, e_row_v * e_col_v * e_gamma_v * val_v);
 
     acc.push(e_row_commit.clone(), point_main.clone(), e_row_v);
-    acc.push(e_col_lo_commit.clone(), point_main.clone(), e_col_lo_v);
-    acc.push(e_col_hi_commit.clone(), point_main.clone(), e_col_hi_v);
+    acc.push(e_col_commit.clone(), point_main.clone(), e_col_v);
     acc.push(e_gamma_commit.clone(), point_main.clone(), e_gamma_v);
     acc.push(commit.val.clone(), point_main, val_v);
 
     let beta_row = ro.next_field();
-    let beta_col_lo = ro.next_field();
-    let beta_col_hi = ro.next_field();
+    let beta_col = ro.next_field();
     let beta_pow = ro.next_field();
     let alpha = ro.next_field();
     let rho = ro.next_field();
 
     let ei_row_commit = read_commit(proof);
-    let ei_col_lo_commit = read_commit(proof);
-    let ei_col_hi_commit = read_commit(proof);
+    let ei_col_commit = read_commit(proof);
     let ei_pow_commit = read_commit(proof);
 
     let s_row = proof.next_f();
-    let s_col_lo = proof.next_f();
-    let s_col_hi = proof.next_f();
+    let s_col = proof.next_f();
     let s_pow = proof.next_f();
 
     let len_l = proof.next_u();
@@ -1934,8 +1645,7 @@ fn verify_b_pre<E: Pairing>(
     let r_eq_l = ro.next_n_fields(nv_l);
     let r_sum_l = ro.next_field();
     let rho2 = rho * rho;
-    let rho3 = rho2 * rho;
-    let y0 = r_sum_l * (s_row + rho * s_col_lo + rho2 * s_col_hi + rho3 * s_pow);
+    let y0 = r_sum_l * (s_row + rho * s_col + rho2 * s_pow);
     let (point_l, y_l) = verifier_sumcheck::<E>(y0, nv_l, 3, proof, ro);
     let e0_v = proof.next_f();
     let ei0_v = proof.next_f();
@@ -1943,55 +1653,37 @@ fn verify_b_pre<E: Pairing>(
     let ei1_v = proof.next_f();
     let e2_v = proof.next_f();
     let ei2_v = proof.next_f();
-    let e3_v = proof.next_f();
-    let ei3_v = proof.next_f();
     let eq_pref = MlPoly::eval_eq_pref(&r_eq_l, &point_l, len_l);
     let one = E::ScalarField::one();
-    let rhs = ((e0_v * ei0_v - one)
-        + rho * (e1_v * ei1_v - one)
-        + rho2 * (e2_v * ei2_v - one)
-        + rho3 * (e3_v * ei3_v - one))
+    let rhs = ((e0_v * ei0_v - one) + rho * (e1_v * ei1_v - one) + rho2 * (e2_v * ei2_v - one))
         * eq_pref
-        + r_sum_l * (ei0_v + rho * ei1_v + rho2 * ei2_v + rho3 * ei3_v);
+        + r_sum_l * (ei0_v + rho * ei1_v + rho2 * ei2_v);
     assert_eq!(y_l, rhs);
 
     let row_idx_v = proof.next_f();
-    let col_lo_idx_v = proof.next_f();
-    let col_hi_idx_v = proof.next_f();
+    let col_idx_v = proof.next_f();
     let pow_idx_v = proof.next_f();
     let e_row_v_l = proof.next_f();
-    let e_col_lo_v_l = proof.next_f();
-    let e_col_hi_v_l = proof.next_f();
+    let e_col_v_l = proof.next_f();
     let e_gamma_v_l = proof.next_f();
 
     let prefix_v = prefix_mle::<E::ScalarField>(&point_l, len_l);
     assert_eq!(e0_v, alpha * prefix_v + row_idx_v + beta_row * e_row_v_l);
-    assert_eq!(
-        e1_v,
-        alpha * prefix_v + col_lo_idx_v + beta_col_lo * e_col_lo_v_l
-    );
-    assert_eq!(
-        e2_v,
-        alpha * prefix_v + col_hi_idx_v + beta_col_hi * e_col_hi_v_l
-    );
-    assert_eq!(e3_v, alpha * prefix_v + pow_idx_v + beta_pow * e_gamma_v_l);
+    assert_eq!(e1_v, alpha * prefix_v + col_idx_v + beta_col * e_col_v_l);
+    assert_eq!(e2_v, alpha * prefix_v + pow_idx_v + beta_pow * e_gamma_v_l);
 
     acc.push(commit.row.clone(), point_l.clone(), row_idx_v);
-    acc.push(commit.col_lo.clone(), point_l.clone(), col_lo_idx_v);
-    acc.push(commit.col_hi.clone(), point_l.clone(), col_hi_idx_v);
+    acc.push(commit.col.clone(), point_l.clone(), col_idx_v);
     acc.push(commit.pow.clone(), point_l.clone(), pow_idx_v);
     acc.push(e_row_commit, point_l.clone(), e_row_v_l);
-    acc.push(e_col_lo_commit, point_l.clone(), e_col_lo_v_l);
-    acc.push(e_col_hi_commit, point_l.clone(), e_col_hi_v_l);
+    acc.push(e_col_commit, point_l.clone(), e_col_v_l);
     acc.push(e_gamma_commit, point_l.clone(), e_gamma_v_l);
     acc.push(ei_row_commit, point_l.clone(), ei0_v);
-    acc.push(ei_col_lo_commit, point_l.clone(), ei1_v);
-    acc.push(ei_col_hi_commit, point_l.clone(), ei2_v);
-    acc.push(ei_pow_commit, point_l, ei3_v);
+    acc.push(ei_col_commit, point_l.clone(), ei1_v);
+    acc.push(ei_pow_commit, point_l, ei2_v);
 
     let tab_inv_row_commit = read_commit(proof);
-    let tab_inv_col_lo_commit = read_commit(proof);
-    let tab_inv_col_hi_commit = read_commit(proof);
+    let tab_inv_col_commit = read_commit(proof);
     let tab_inv_pow_commit = read_commit(proof);
 
     verify_memory_right::<E>(
@@ -2010,24 +1702,12 @@ fn verify_b_pre<E: Pairing>(
         proof,
         ro,
         alpha,
-        beta_col_lo,
-        s_col_lo,
-        commit.log_col_lo,
-        |pt| MlPoly::<E::ScalarField>::eval_eq(&point_lo, &pt.to_vec()),
-        tab_inv_col_lo_commit,
-        commit.count_col_lo.clone(),
-        acc,
-    );
-    verify_memory_right::<E>(
-        proof,
-        ro,
-        alpha,
-        beta_col_hi,
-        s_col_hi,
-        commit.log_col_hi,
-        |pt| MlPoly::<E::ScalarField>::eval_eq(&point_hi, &pt.to_vec()),
-        tab_inv_col_hi_commit,
-        commit.count_col_hi.clone(),
+        beta_col,
+        s_col,
+        commit.log_col,
+        |pt| MlPoly::<E::ScalarField>::eval_eq(&col_eq_point.to_vec(), &pt.to_vec()),
+        tab_inv_col_commit,
+        commit.count_col.clone(),
         acc,
     );
     verify_memory_right::<E>(
