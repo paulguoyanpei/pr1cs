@@ -368,6 +368,11 @@ mod tests {
                 commits.supergroups[0].matrix_lens,
                 polys.supergroups[0].matrix_lens
             );
+            assert_eq!(polys.b_pre.len, commits.b_pre.len);
+            assert_eq!(polys.b_pre.log_col_lo, commits.b_pre.log_col_lo);
+            assert_eq!(polys.b_pre.log_col_hi, commits.b_pre.log_col_hi);
+            assert!(polys.b_pre.count_col_lo.0.len() < circuit.weight_len);
+            assert!(polys.b_pre.count_col_hi.0.len() < circuit.weight_len);
         }
     }
 
@@ -544,6 +549,27 @@ mod tests {
 
         let mut bad_vk = vk.clone();
         bad_vk.table_i_commit = bad_vk.table_j_commit.clone();
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            Verifier::new(bad_vk).verify(proof, gamma, &mut ro)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn wrong_b_pre_commit_rejects() {
+        let (program, input, circuit, output_start) = sample_fixture();
+        let mut rng = StdRng::seed_from_u64(43);
+        let gamma = Fr::rand(&mut rng);
+        let trace = program.execute(input);
+        let z = program.gen_z(output_start, trace, gamma);
+        let (kzg_pp, kzg_vp) = Mkzg::<Bn254>::gen_srs(5, &mut rng);
+        let (pk, vk) = Preprocessor::build(kzg_pp, kzg_vp, circuit);
+        let prover = Prover::new(pk);
+        let mut ro = RandomOracle::new(&mut rng);
+        let proof = prover.prove(z, gamma, &mut ro);
+
+        let mut bad_vk = vk.clone();
+        bad_vk.sparse_commits.b_pre.val = bad_vk.sparse_commits.b_pre.row.clone();
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             Verifier::new(bad_vk).verify(proof, gamma, &mut ro)
         }));
