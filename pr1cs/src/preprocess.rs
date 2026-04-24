@@ -87,7 +87,7 @@ mod tests {
 
     use ark_bn254::{Bn254, Fr};
     use ark_ff::UniformRand;
-    use rand::{SeedableRng, rngs::StdRng};
+    use rand::{rngs::StdRng, SeedableRng};
     use util::{kzg::Mkzg, poly::MlPoly, util::RandomOracle};
 
     use super::Preprocessor;

@@ -1,7 +1,6 @@
 use ark_ec::pairing::Pairing;
 use ark_ff::{Field, One, PrimeField, Zero};
 use rayon::prelude::*;
-use std::{env, time::Instant};
 
 use util::{
     kzg::{Mkzg, MkzgCommit, MkzgProof, MkzgProveParams, MkzgVerParams, SumcheckProof},
@@ -20,41 +19,6 @@ pub const NUM_CLAIMS: usize = 10;
 pub const NUM_SUPERGROUPS: usize = 1;
 
 const SUF_CLAIMS: &[usize] = &[0, 1, 2, 3, 4];
-
-struct DebugTimer {
-    name: &'static str,
-    enabled: bool,
-    start: Instant,
-    last: Instant,
-}
-
-impl DebugTimer {
-    fn new(name: &'static str) -> Self {
-        let enabled = env::var_os("PR1CS_DEBUG_SPARSE_OPEN").is_some();
-        let now = Instant::now();
-        DebugTimer {
-            name,
-            enabled,
-            start: now,
-            last: now,
-        }
-    }
-
-    fn log(&mut self, label: &str) {
-        if !self.enabled {
-            return;
-        }
-        let now = Instant::now();
-        eprintln!(
-            "[debug][{}] {}: {:?} (total {:?})",
-            self.name,
-            label,
-            now.duration_since(self.last),
-            now.duration_since(self.start)
-        );
-        self.last = now;
-    }
-}
 
 #[derive(Clone)]
 pub struct SparseSupergroup<F: PrimeField> {
@@ -202,6 +166,10 @@ fn gamma_mle<F: Field>(point: &[F], gamma: F) -> F {
         pow_2j = pow_2j * pow_2j;
     }
     acc
+}
+
+fn lerp<F: Field>(a: F, b: F, r: F) -> F {
+    a + (b - a) * r
 }
 
 fn pad_point<F: Field>(point: &[F], len: usize) -> Vec<F> {
@@ -556,6 +524,158 @@ fn sumcheck_main4<E: Pairing>(
     new_point
 }
 
+fn gkr_layer_sumcheck_prove<E: Pairing>(
+    mut p_lo: Vec<E::ScalarField>,
+    mut q_lo: Vec<E::ScalarField>,
+    mut p_hi: Vec<E::ScalarField>,
+    mut q_hi: Vec<E::ScalarField>,
+    claim_point: &[E::ScalarField],
+    lambda: E::ScalarField,
+    proof: &mut Proof<E>,
+    ro: &mut RandomOracle<E::ScalarField>,
+) -> (Vec<E::ScalarField>, [E::ScalarField; 4]) {
+    assert_eq!(p_lo.len(), q_lo.len());
+    assert_eq!(p_lo.len(), p_hi.len());
+    assert_eq!(p_lo.len(), q_hi.len());
+    proof.push_u(p_lo.len());
+    let log_len = log2_ceil(p_lo.len());
+    assert_eq!(log_len, claim_point.len());
+    let mut eq = MlPoly::new_eq(&claim_point.to_vec()).0;
+    let mut new_point = vec![];
+
+    let contrib =
+        |plo: E::ScalarField,
+         qlo: E::ScalarField,
+         phi: E::ScalarField,
+         qhi: E::ScalarField,
+         eqv: E::ScalarField| { eqv * (plo * qhi + phi * qlo + lambda * qlo * qhi) };
+
+    for _ in 0..log_len {
+        let m = p_lo.len();
+        let mut sums = [E::ScalarField::zero(); 4];
+        for j in (0..m).step_by(2) {
+            let d_plo = p_lo[j + 1] - p_lo[j];
+            let d_qlo = q_lo[j + 1] - q_lo[j];
+            let d_phi = p_hi[j + 1] - p_hi[j];
+            let d_qhi = q_hi[j + 1] - q_hi[j];
+            let d_eq = eq[j + 1] - eq[j];
+
+            sums[0] += contrib(p_lo[j], q_lo[j], p_hi[j], q_hi[j], eq[j]);
+            sums[1] += contrib(
+                p_lo[j + 1],
+                q_lo[j + 1],
+                p_hi[j + 1],
+                q_hi[j + 1],
+                eq[j + 1],
+            );
+
+            let mut v_plo = p_lo[j + 1];
+            let mut v_qlo = q_lo[j + 1];
+            let mut v_phi = p_hi[j + 1];
+            let mut v_qhi = q_hi[j + 1];
+            let mut v_eq = eq[j + 1];
+            for k in 2..=3 {
+                let _ = k;
+                v_plo += d_plo;
+                v_qlo += d_qlo;
+                v_phi += d_phi;
+                v_qhi += d_qhi;
+                v_eq += d_eq;
+                sums[k] += contrib(v_plo, v_qlo, v_phi, v_qhi, v_eq);
+            }
+        }
+        proof.push_f(&sums);
+        let challenge = ro.next_field();
+        new_point.push(challenge);
+        for i in 0..m / 2 {
+            p_lo[i] = lerp(p_lo[i * 2], p_lo[i * 2 + 1], challenge);
+            q_lo[i] = lerp(q_lo[i * 2], q_lo[i * 2 + 1], challenge);
+            p_hi[i] = lerp(p_hi[i * 2], p_hi[i * 2 + 1], challenge);
+            q_hi[i] = lerp(q_hi[i * 2], q_hi[i * 2 + 1], challenge);
+            eq[i] = lerp(eq[i * 2], eq[i * 2 + 1], challenge);
+        }
+        p_lo.truncate(m / 2);
+        q_lo.truncate(m / 2);
+        p_hi.truncate(m / 2);
+        q_hi.truncate(m / 2);
+        eq.truncate(m / 2);
+    }
+
+    let final_claims = [p_lo[0], q_lo[0], p_hi[0], q_hi[0]];
+    proof.push_f(&final_claims);
+    (new_point, final_claims)
+}
+
+fn gkr_fractional_sum_prove<E: Pairing>(
+    p_leaf: Vec<E::ScalarField>,
+    q_leaf: Vec<E::ScalarField>,
+    claim: E::ScalarField,
+    proof: &mut Proof<E>,
+    ro: &mut RandomOracle<E::ScalarField>,
+) -> Vec<E::ScalarField> {
+    assert_eq!(p_leaf.len(), q_leaf.len());
+    assert!(p_leaf.len().is_power_of_two());
+    let log_len = p_leaf.len().ilog2() as usize;
+    assert!(log_len >= 1);
+
+    let mut p_layers = vec![p_leaf];
+    let mut q_layers = vec![q_leaf];
+    while p_layers.last().unwrap().len() > 1 {
+        let child_p = p_layers.last().unwrap();
+        let child_q = q_layers.last().unwrap();
+        let mut parent_p = vec![E::ScalarField::zero(); child_p.len() / 2];
+        let mut parent_q = vec![E::ScalarField::zero(); child_p.len() / 2];
+        let half = child_p.len() / 2;
+        for i in 0..parent_p.len() {
+            let p0 = child_p[i];
+            let q0 = child_q[i];
+            let p1 = child_p[i + half];
+            let q1 = child_q[i + half];
+            parent_p[i] = p0 * q1 + p1 * q0;
+            parent_q[i] = q0 * q1;
+        }
+        p_layers.push(parent_p);
+        q_layers.push(parent_q);
+    }
+    p_layers.reverse();
+    q_layers.reverse();
+
+    let p0 = p_layers[1][0];
+    let q0 = q_layers[1][0];
+    let p1 = p_layers[1][1];
+    let q1 = q_layers[1][1];
+    proof.push_f(&[p0, q0, p1, q1]);
+    assert_eq!(p0 * q1 + p1 * q0, claim * q0 * q1);
+
+    let mu0 = ro.next_field();
+    let mut point = vec![mu0];
+    let mut claim_p = lerp(p0, p1, mu0);
+    let mut claim_q = lerp(q0, q1, mu0);
+
+    for k in 1..log_len {
+        let lambda = ro.next_field();
+        let child_p = &p_layers[k + 1];
+        let child_q = &q_layers[k + 1];
+        let half = child_p.len() / 2;
+        let p_lo = child_p[..half].to_vec();
+        let q_lo = child_q[..half].to_vec();
+        let p_hi = child_p[half..].to_vec();
+        let q_hi = child_q[half..].to_vec();
+
+        let (rho, [p0, q0, p1, q1]) =
+            gkr_layer_sumcheck_prove::<E>(p_lo, q_lo, p_hi, q_hi, &point, lambda, proof, ro);
+        let mu = ro.next_field();
+        point = rho;
+        point.push(mu);
+        claim_p = lerp(p0, p1, mu);
+        claim_q = lerp(q0, q1, mu);
+    }
+
+    assert_eq!(claim_p, MlPoly::new(p_layers[log_len].clone()).eval(&point));
+    assert_eq!(claim_q, MlPoly::new(q_layers[log_len].clone()).eval(&point));
+    point
+}
+
 fn sumcheck_vrho_consistency<E: Pairing>(
     point: &[E::ScalarField],
     mut w: Vec<E::ScalarField>,
@@ -599,194 +719,6 @@ fn sumcheck_vrho_consistency<E: Pairing>(
         val.truncate(m / 2);
     }
     proof.push_f(&[eq[0], w[0], val[0]]);
-    new_point
-}
-
-// RLC-combined logup-left sumcheck for 3 independent lookups sharing the same
-// alpha: prove
-//     sum_t [(er[t]*eir[t]-1) + rho*(ec[t]*eic[t]-1) + rho^2*(eg[t]*eig[t]-1)] * eq[t]
-//         + r_sum * (eir[t] + rho*eic[t] + rho^2*eig[t])
-//   = r_sum * (S_row + rho*S_col + rho^2*S_pow).
-// Degree 3 per round.
-#[allow(clippy::too_many_arguments)]
-fn combined_logup_left<E: Pairing>(
-    mut er: Vec<E::ScalarField>,
-    mut eir: Vec<E::ScalarField>,
-    mut ec: Vec<E::ScalarField>,
-    mut eic: Vec<E::ScalarField>,
-    mut eg: Vec<E::ScalarField>,
-    mut eig: Vec<E::ScalarField>,
-    alpha: E::ScalarField,
-    rho: E::ScalarField,
-    proof: &mut Proof<E>,
-    ro: &mut RandomOracle<E::ScalarField>,
-) -> Vec<E::ScalarField> {
-    let log_len = log2_ceil(er.len());
-    er.iter_mut().for_each(|x| *x += alpha);
-    ec.iter_mut().for_each(|x| *x += alpha);
-    eg.iter_mut().for_each(|x| *x += alpha);
-    proof.push_u(er.len());
-    let mut eq = MlPoly::new_eq(&ro.next_n_fields(log_len)).0;
-    eq.truncate(er.len());
-    let r_sum = ro.next_field();
-    let rho2 = rho * rho;
-    let one = E::ScalarField::one();
-
-    let contrib = |er: E::ScalarField,
-                   eir: E::ScalarField,
-                   ec: E::ScalarField,
-                   eic: E::ScalarField,
-                   eg: E::ScalarField,
-                   eig: E::ScalarField,
-                   eq: E::ScalarField|
-     -> E::ScalarField {
-        let prod_row = er * eir - one;
-        let prod_col = ec * eic - one;
-        let prod_pow = eg * eig - one;
-        let inv_comb = eir + rho * eic + rho2 * eig;
-        (prod_row + rho * prod_col + rho2 * prod_pow) * eq + r_sum * inv_comb
-    };
-
-    let mut new_point = vec![];
-    for _ in 0..log_len {
-        if er.len() % 2 == 1 {
-            er.push(E::ScalarField::zero());
-            eir.push(E::ScalarField::zero());
-            ec.push(E::ScalarField::zero());
-            eic.push(E::ScalarField::zero());
-            eg.push(E::ScalarField::zero());
-            eig.push(E::ScalarField::zero());
-            eq.push(E::ScalarField::zero());
-        }
-        let m = er.len();
-        // Degree 3 (triple products ele * ele_inv * eq).
-        let mut sums = [E::ScalarField::zero(); 4];
-        for j in (0..m).step_by(2) {
-            let der = er[j + 1] - er[j];
-            let deir = eir[j + 1] - eir[j];
-            let dec = ec[j + 1] - ec[j];
-            let deic = eic[j + 1] - eic[j];
-            let deg = eg[j + 1] - eg[j];
-            let deig = eig[j + 1] - eig[j];
-            let deq = eq[j + 1] - eq[j];
-
-            sums[0] += contrib(er[j], eir[j], ec[j], eic[j], eg[j], eig[j], eq[j]);
-            sums[1] += contrib(
-                er[j + 1],
-                eir[j + 1],
-                ec[j + 1],
-                eic[j + 1],
-                eg[j + 1],
-                eig[j + 1],
-                eq[j + 1],
-            );
-            let mut ver = er[j + 1];
-            let mut veir = eir[j + 1];
-            let mut vec_ = ec[j + 1];
-            let mut veic = eic[j + 1];
-            let mut veg = eg[j + 1];
-            let mut veig = eig[j + 1];
-            let mut veq = eq[j + 1];
-            for k in 2..=3 {
-                ver += der;
-                veir += deir;
-                vec_ += dec;
-                veic += deic;
-                veg += deg;
-                veig += deig;
-                veq += deq;
-                sums[k] += contrib(ver, veir, vec_, veic, veg, veig, veq);
-            }
-        }
-        proof.push_f(&sums);
-        let ch = ro.next_field();
-        new_point.push(ch);
-        for i in 0..m / 2 {
-            er[i] = er[i * 2] + (er[i * 2 + 1] - er[i * 2]) * ch;
-            eir[i] = eir[i * 2] + (eir[i * 2 + 1] - eir[i * 2]) * ch;
-            ec[i] = ec[i * 2] + (ec[i * 2 + 1] - ec[i * 2]) * ch;
-            eic[i] = eic[i * 2] + (eic[i * 2 + 1] - eic[i * 2]) * ch;
-            eg[i] = eg[i * 2] + (eg[i * 2 + 1] - eg[i * 2]) * ch;
-            eig[i] = eig[i * 2] + (eig[i * 2 + 1] - eig[i * 2]) * ch;
-            eq[i] = eq[i * 2] + (eq[i * 2 + 1] - eq[i * 2]) * ch;
-        }
-        er.truncate(m / 2);
-        eir.truncate(m / 2);
-        ec.truncate(m / 2);
-        eic.truncate(m / 2);
-        eg.truncate(m / 2);
-        eig.truncate(m / 2);
-        eq.truncate(m / 2);
-    }
-    assert_eq!(er.len(), 1);
-    proof.push_f(&[er[0], eir[0], ec[0], eic[0], eg[0], eig[0]]);
-    new_point
-}
-
-fn logup_sumcheck_right<E: Pairing>(
-    mut tab: Vec<E::ScalarField>,
-    mut tab_inv: Vec<E::ScalarField>,
-    mut count: Vec<E::ScalarField>,
-    alpha: E::ScalarField,
-    proof: &mut Proof<E>,
-    ro: &mut RandomOracle<E::ScalarField>,
-) -> Vec<E::ScalarField> {
-    let log_len = log2_ceil(tab.len());
-    tab.iter_mut().for_each(|x| *x += alpha);
-    proof.push_u(tab.len());
-    let mut eq = MlPoly::new_eq(&ro.next_n_fields(log_len)).0;
-    eq.truncate(tab.len());
-    let r = ro.next_field();
-    let mut new_point = vec![];
-
-    for _ in 0..log_len {
-        if tab.len() % 2 == 1 {
-            tab.push(E::ScalarField::zero());
-            tab_inv.push(E::ScalarField::zero());
-            count.push(E::ScalarField::zero());
-            eq.push(E::ScalarField::zero());
-        }
-        let m = tab.len();
-        let mut sums = [E::ScalarField::zero(); 4];
-
-        for j in (0..m).step_by(2) {
-            let diff_tab = tab[j + 1] - tab[j];
-            let diff_tab_inv = tab_inv[j + 1] - tab_inv[j];
-            let diff_count = count[j + 1] - count[j];
-            let diff_eq = eq[j + 1] - eq[j];
-            sums[0] +=
-                (tab[j] * tab_inv[j] - E::ScalarField::one()) * eq[j] + r * tab_inv[j] * count[j];
-            sums[1] += (tab[j + 1] * tab_inv[j + 1] - E::ScalarField::one()) * eq[j + 1]
-                + r * tab_inv[j + 1] * count[j + 1];
-            sums[2] += ((tab[j + 1] + diff_tab) * (tab_inv[j + 1] + diff_tab_inv)
-                - E::ScalarField::one())
-                * (eq[j + 1] + diff_eq)
-                + r * (tab_inv[j + 1] + diff_tab_inv) * (count[j + 1] + diff_count);
-            sums[3] += ((tab[j + 1] + diff_tab + diff_tab)
-                * (tab_inv[j + 1] + diff_tab_inv + diff_tab_inv)
-                - E::ScalarField::one())
-                * (eq[j + 1] + diff_eq + diff_eq)
-                + r * (tab_inv[j + 1] + diff_tab_inv + diff_tab_inv)
-                    * (count[j + 1] + diff_count + diff_count);
-        }
-
-        proof.push_f(&sums);
-        let challenge = ro.next_field();
-        new_point.push(challenge);
-        for i in 0..m / 2 {
-            tab[i] = tab[i * 2] + (tab[i * 2 + 1] - tab[i * 2]) * challenge;
-            tab_inv[i] = tab_inv[i * 2] + (tab_inv[i * 2 + 1] - tab_inv[i * 2]) * challenge;
-            count[i] = count[i * 2] + (count[i * 2 + 1] - count[i * 2]) * challenge;
-            eq[i] = eq[i * 2] + (eq[i * 2 + 1] - eq[i * 2]) * challenge;
-        }
-        tab.truncate(m / 2);
-        tab_inv.truncate(m / 2);
-        count.truncate(m / 2);
-        eq.truncate(m / 2);
-    }
-
-    assert_eq!(tab.len(), 1);
-    proof.push_f(&[tab[0], tab_inv[0], count[0]]);
     new_point
 }
 
@@ -843,6 +775,48 @@ fn verifier_sumcheck<E: Pairing>(
         y = uni_extrapolate(&base, &sums, challenge);
     }
     (new_point, y)
+}
+
+fn gkr_fractional_sum_verify<E: Pairing>(
+    claim: E::ScalarField,
+    log_len: usize,
+    proof: &mut Proof<E>,
+    ro: &mut RandomOracle<E::ScalarField>,
+) -> (Vec<E::ScalarField>, E::ScalarField, E::ScalarField) {
+    let p0 = proof.next_f();
+    let q0 = proof.next_f();
+    let p1 = proof.next_f();
+    let q1 = proof.next_f();
+    assert_eq!(p0 * q1 + p1 * q0, claim * q0 * q1);
+
+    let mu0 = ro.next_field();
+    let mut point = vec![mu0];
+    let mut claim_p = lerp(p0, p1, mu0);
+    let mut claim_q = lerp(q0, q1, mu0);
+
+    for k in 1..log_len {
+        let lambda = ro.next_field();
+        let len = proof.next_u();
+        let nv = log2_ceil(len);
+        assert_eq!(nv, k);
+        let (rho, y) = verifier_sumcheck::<E>(claim_p + lambda * claim_q, nv, 3, proof, ro);
+        let p0 = proof.next_f();
+        let q0 = proof.next_f();
+        let p1 = proof.next_f();
+        let q1 = proof.next_f();
+        assert_eq!(
+            y,
+            MlPoly::eval_eq(&point.to_vec(), &rho.to_vec())
+                * (p0 * q1 + p1 * q0 + lambda * q0 * q1)
+        );
+        let mu = ro.next_field();
+        point = rho;
+        point.push(mu);
+        claim_p = lerp(p0, p1, mu);
+        claim_q = lerp(q0, q1, mu);
+    }
+
+    (point, claim_p, claim_q)
 }
 
 // ============================================================
@@ -989,14 +963,13 @@ fn lasso_prove_supergroup<E: Pairing>(
     acc.push(v_rho_poly, point_main);
     acc.push(sg.val.clone(), point_vrho);
 
-    // Memory-check setup: sample three betas, then alpha, then rho for RLC.
+    // Memory-check setup: sample three betas, then alpha.
     let beta_row = ro.next_field();
     let beta_col = ro.next_field();
     let beta_pow = ro.next_field();
     let alpha = ro.next_field();
-    let rho = ro.next_field();
 
-    // Compute ele_X and ele_inv_X.
+    // Compute ele_X and their reciprocal sums.
     let ele_row: Vec<E::ScalarField> = (0..sg.len)
         .into_par_iter()
         .map(|k| sg.row.0[k] + beta_row * e_row[k])
@@ -1017,115 +990,89 @@ fn lasso_prove_supergroup<E: Pairing>(
     let mut eig: Vec<E::ScalarField> = ele_pow.iter().map(|&x| x + alpha).collect();
     batch_inverse(&mut eig);
 
-    let eir_poly = MlPoly::new(eir.clone());
-    let eic_poly = MlPoly::new(eic.clone());
-    let eig_poly = MlPoly::new(eig.clone());
-
-    // Commit the three ele_inv polys (parallel MSMs).
-    let ele_inv_commits: Vec<MkzgCommit<E>> = [&eir_poly, &eic_poly, &eig_poly]
-        .par_iter()
-        .map(|p| Mkzg::<E>::commit(kzg_pp, p))
-        .collect();
-    for c in &ele_inv_commits {
-        proof.push_u(c.0.len());
-        proof.push_gs(&c.0);
-    }
-
     let s_row: E::ScalarField = eir.iter().copied().sum();
     let s_col: E::ScalarField = eic.iter().copied().sum();
     let s_pow: E::ScalarField = eig.iter().copied().sum();
     proof.push_f(&[s_row, s_col, s_pow]);
-
-    // Combined logup-left sumcheck.
-    let point_l = combined_logup_left::<E>(
-        ele_row,
-        eir.clone(),
-        ele_col,
-        eic.clone(),
-        ele_pow,
-        eig.clone(),
-        alpha,
-        rho,
-        proof,
-        ro,
-    );
-
-    // Open idx and e polys at point_l.
-    let row_idx_v = sg.row.clone().eval(&point_l);
-    let col_idx_v = sg.col.clone().eval(&point_l);
-    let pow_idx_v = sg.pow.clone().eval(&point_l);
-    let e_row_v_l = e_row_poly.clone().eval(&point_l);
-    let e_col_v_l = e_col_poly.clone().eval(&point_l);
-    let e_gamma_v_l = e_gamma_poly.clone().eval(&point_l);
-    proof.push_f(&[
-        row_idx_v,
-        col_idx_v,
-        pow_idx_v,
-        e_row_v_l,
-        e_col_v_l,
-        e_gamma_v_l,
-    ]);
-
-    acc.push(sg.row.clone(), point_l.clone());
-    acc.push(sg.col.clone(), point_l.clone());
-    acc.push(sg.pow.clone(), point_l.clone());
-    acc.push(e_row_poly, point_l.clone());
-    acc.push(e_col_poly, point_l.clone());
-    acc.push(e_gamma_poly, point_l.clone());
-    acc.push(eir_poly, point_l.clone());
-    acc.push(eic_poly, point_l.clone());
-    acc.push(eig_poly, point_l);
-
-    // Three memory-right sumchecks (one per table). Work in parallel on tab and tab_inv
-    // construction, but each sumcheck itself must run sequentially (shared RO & proof).
-    let build_right = |table: &[E::ScalarField],
-                       beta: E::ScalarField|
-     -> (Vec<E::ScalarField>, Vec<E::ScalarField>) {
-        let tab: Vec<E::ScalarField> = (0..table.len())
-            .into_par_iter()
-            .map(|i| E::ScalarField::from(i as u64) + beta * table[i])
-            .collect();
-        let mut tab_inv: Vec<E::ScalarField> = tab.iter().map(|&x| x + alpha).collect();
-        batch_inverse(&mut tab_inv);
-        (tab, tab_inv)
-    };
-
-    let right_inputs = vec![
-        (&row_eq[..], beta_row, &sg.count_row),
-        (&col_eq[..], beta_col, &sg.count_col),
-        (&gamma_table[..], beta_pow, &sg.count_pow),
-    ];
-    // Precompute tab and tab_inv for all 3 tables in parallel.
-    let right_tabs: Vec<(Vec<E::ScalarField>, Vec<E::ScalarField>)> = right_inputs
-        .par_iter()
-        .map(|(t, b, _)| build_right(t, *b))
+    let left_log_len = log2_ceil(sg.len);
+    let left_dom = 1usize << left_log_len;
+    let mut p_leaf = vec![E::ScalarField::zero(); left_dom];
+    p_leaf[..sg.len].fill(E::ScalarField::one());
+    let q_row_leaf: Vec<E::ScalarField> = (0..left_dom)
+        .map(|i| {
+            if i < sg.len {
+                ele_row[i] + alpha
+            } else {
+                E::ScalarField::one()
+            }
+        })
+        .collect();
+    let q_col_leaf: Vec<E::ScalarField> = (0..left_dom)
+        .map(|i| {
+            if i < sg.len {
+                ele_col[i] + alpha
+            } else {
+                E::ScalarField::one()
+            }
+        })
+        .collect();
+    let q_pow_leaf: Vec<E::ScalarField> = (0..left_dom)
+        .map(|i| {
+            if i < sg.len {
+                ele_pow[i] + alpha
+            } else {
+                E::ScalarField::one()
+            }
+        })
         .collect();
 
-    // Commit tab_inv polys in parallel.
-    let tab_inv_polys: Vec<MlPoly<E::ScalarField>> = right_tabs
-        .iter()
-        .map(|(_, ti)| MlPoly::new(ti.clone()))
-        .collect();
-    let tab_inv_commits: Vec<MkzgCommit<E>> = tab_inv_polys
-        .par_iter()
-        .map(|p| Mkzg::<E>::commit(kzg_pp, p))
-        .collect();
-    for c in &tab_inv_commits {
-        proof.push_u(c.0.len());
-        proof.push_gs(&c.0);
-    }
+    let row_left_point =
+        gkr_fractional_sum_prove::<E>(p_leaf.clone(), q_row_leaf, s_row, proof, ro);
+    let row_idx_v = sg.row.clone().eval(&row_left_point);
+    let e_row_v_l = e_row_poly.clone().eval(&row_left_point);
+    proof.push_f(&[row_idx_v, e_row_v_l]);
+    acc.push(sg.row.clone(), row_left_point.clone());
+    acc.push(e_row_poly.clone(), row_left_point);
 
-    // Now run the 3 right-side sumchecks sequentially, interleaving
-    // tab_inv/count opens to match the verifier's push order.
-    for ((tab, tab_inv), (tip, (_, _, count_poly))) in right_tabs
-        .into_iter()
-        .zip(tab_inv_polys.into_iter().zip(right_inputs.iter()))
-    {
-        let point_r =
-            logup_sumcheck_right::<E>(tab, tab_inv, count_poly.0.clone(), alpha, proof, ro);
-        acc.push(tip, point_r.clone());
-        acc.push((*count_poly).clone(), point_r);
-    }
+    let col_left_point =
+        gkr_fractional_sum_prove::<E>(p_leaf.clone(), q_col_leaf, s_col, proof, ro);
+    let col_idx_v = sg.col.clone().eval(&col_left_point);
+    let e_col_v_l = e_col_poly.clone().eval(&col_left_point);
+    proof.push_f(&[col_idx_v, e_col_v_l]);
+    acc.push(sg.col.clone(), col_left_point.clone());
+    acc.push(e_col_poly.clone(), col_left_point);
+
+    let pow_left_point = gkr_fractional_sum_prove::<E>(p_leaf, q_pow_leaf, s_pow, proof, ro);
+    let pow_idx_v = sg.pow.clone().eval(&pow_left_point);
+    let e_gamma_v_l = e_gamma_poly.clone().eval(&pow_left_point);
+    proof.push_f(&[pow_idx_v, e_gamma_v_l]);
+    acc.push(sg.pow.clone(), pow_left_point.clone());
+    acc.push(e_gamma_poly.clone(), pow_left_point);
+
+    let row_tab: Vec<E::ScalarField> = (0..(1usize << sg.log_row))
+        .into_par_iter()
+        .map(|i| alpha + E::ScalarField::from(i as u64) + beta_row * row_eq[i])
+        .collect();
+    let col_tab: Vec<E::ScalarField> = (0..(1usize << sg.log_col))
+        .into_par_iter()
+        .map(|i| alpha + E::ScalarField::from(i as u64) + beta_col * col_eq[i])
+        .collect();
+    let pow_tab: Vec<E::ScalarField> = (0..(1usize << sg.log_pow))
+        .into_par_iter()
+        .map(|i| alpha + E::ScalarField::from(i as u64) + beta_pow * gamma_table[i])
+        .collect();
+
+    let row_right_point =
+        gkr_fractional_sum_prove::<E>(sg.count_row.0.clone(), row_tab, s_row, proof, ro);
+    acc.push(sg.count_row.clone(), row_right_point);
+
+    let col_right_point =
+        gkr_fractional_sum_prove::<E>(sg.count_col.0.clone(), col_tab, s_col, proof, ro);
+    acc.push(sg.count_col.clone(), col_right_point);
+
+    let pow_right_point =
+        gkr_fractional_sum_prove::<E>(sg.count_pow.0.clone(), pow_tab, s_pow, proof, ro);
+    acc.push(sg.count_pow.clone(), pow_right_point);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1140,7 +1087,6 @@ fn prove_b_pre<E: Pairing>(
     ro: &mut RandomOracle<E::ScalarField>,
     acc: &mut ProverAcc<E::ScalarField>,
 ) {
-    let mut timer = DebugTimer::new("sparse_open::b_pre");
     assert_eq!(row_eq_point.len(), group.log_row);
     assert_eq!(col_eq_point.len(), group.log_col);
 
@@ -1155,12 +1101,9 @@ fn prove_b_pre<E: Pairing>(
         }
         out
     };
-    timer.log("build eq tables");
-
     let e_row: Vec<E::ScalarField> = group.row_idx.par_iter().map(|&i| row_eq[i]).collect();
     let e_col: Vec<E::ScalarField> = group.col_idx.par_iter().map(|&i| col_eq[i]).collect();
     let e_gamma: Vec<E::ScalarField> = group.pow_idx.par_iter().map(|&i| gamma_table[i]).collect();
-    timer.log("materialize table reads");
 
     let e_row_poly = MlPoly::new(e_row.clone());
     let e_col_poly = MlPoly::new(e_col.clone());
@@ -1173,13 +1116,11 @@ fn prove_b_pre<E: Pairing>(
         proof.push_u(c.0.len());
         proof.push_gs(&c.0);
     }
-    timer.log("commit read polys");
     let direct_claim: E::ScalarField = (0..group.len)
         .into_par_iter()
         .map(|i| e_row[i] * e_col[i] * e_gamma[i] * group.val.0[i])
         .sum();
     assert_eq!(direct_claim, claim);
-    timer.log("compute direct claim");
 
     let point_main = sumcheck_main4::<E>(
         e_row.clone(),
@@ -1189,7 +1130,6 @@ fn prove_b_pre<E: Pairing>(
         proof,
         ro,
     );
-    timer.log("main sumcheck");
     acc.push(e_row_poly.clone(), point_main.clone());
     acc.push(e_col_poly.clone(), point_main.clone());
     acc.push(e_gamma_poly.clone(), point_main.clone());
@@ -1199,8 +1139,6 @@ fn prove_b_pre<E: Pairing>(
     let beta_col = ro.next_field();
     let beta_pow = ro.next_field();
     let alpha = ro.next_field();
-    let rho = ro.next_field();
-    timer.log("sample logup challenges");
 
     let ele_row: Vec<E::ScalarField> = (0..group.len)
         .into_par_iter()
@@ -1214,7 +1152,6 @@ fn prove_b_pre<E: Pairing>(
         .into_par_iter()
         .map(|k| group.pow.0[k] + beta_pow * e_gamma[k])
         .collect();
-    timer.log("build left logup inputs");
 
     let mut ei_row: Vec<E::ScalarField> = ele_row.iter().map(|&x| x + alpha).collect();
     batch_inverse(&mut ei_row);
@@ -1222,112 +1159,91 @@ fn prove_b_pre<E: Pairing>(
     batch_inverse(&mut ei_col);
     let mut ei_pow: Vec<E::ScalarField> = ele_pow.iter().map(|&x| x + alpha).collect();
     batch_inverse(&mut ei_pow);
-    timer.log("batch invert left inputs");
-
-    let ei_row_poly = MlPoly::new(ei_row.clone());
-    let ei_col_poly = MlPoly::new(ei_col.clone());
-    let ei_pow_poly = MlPoly::new(ei_pow.clone());
-    let inv_commits: Vec<MkzgCommit<E>> = [&ei_row_poly, &ei_col_poly, &ei_pow_poly]
-        .par_iter()
-        .map(|p| Mkzg::<E>::commit(kzg_pp, p))
-        .collect();
-    for c in &inv_commits {
-        proof.push_u(c.0.len());
-        proof.push_gs(&c.0);
-    }
-    timer.log("commit inverse polys");
 
     let s_row: E::ScalarField = ei_row.iter().copied().sum();
     let s_col: E::ScalarField = ei_col.iter().copied().sum();
     let s_pow: E::ScalarField = ei_pow.iter().copied().sum();
     proof.push_f(&[s_row, s_col, s_pow]);
-    timer.log("accumulate inverse sums");
 
-    let point_l = combined_logup_left::<E>(
-        ele_row,
-        ei_row.clone(),
-        ele_col,
-        ei_col.clone(),
-        ele_pow,
-        ei_pow.clone(),
-        alpha,
-        rho,
-        proof,
-        ro,
-    );
-    timer.log("left logup sumcheck");
-
-    let row_idx_v = group.row.clone().eval(&point_l);
-    let col_idx_v = group.col.clone().eval(&point_l);
-    let pow_idx_v = group.pow.clone().eval(&point_l);
-    let e_row_v_l = e_row_poly.clone().eval(&point_l);
-    let e_col_v_l = e_col_poly.clone().eval(&point_l);
-    let e_gamma_v_l = e_gamma_poly.clone().eval(&point_l);
-    proof.push_f(&[
-        row_idx_v,
-        col_idx_v,
-        pow_idx_v,
-        e_row_v_l,
-        e_col_v_l,
-        e_gamma_v_l,
-    ]);
-    timer.log("evaluate left point");
-
-    acc.push(group.row.clone(), point_l.clone());
-    acc.push(group.col.clone(), point_l.clone());
-    acc.push(group.pow.clone(), point_l.clone());
-    acc.push(e_row_poly, point_l.clone());
-    acc.push(e_col_poly, point_l.clone());
-    acc.push(e_gamma_poly, point_l.clone());
-    acc.push(ei_row_poly, point_l.clone());
-    acc.push(ei_col_poly, point_l.clone());
-    acc.push(ei_pow_poly, point_l);
-    timer.log("queue left batch opens");
-
-    let build_right = |table: &[E::ScalarField],
-                       beta: E::ScalarField|
-     -> (Vec<E::ScalarField>, Vec<E::ScalarField>) {
-        let tab: Vec<E::ScalarField> = (0..table.len())
-            .into_par_iter()
-            .map(|i| E::ScalarField::from(i as u64) + beta * table[i])
-            .collect();
-        let mut tab_inv: Vec<E::ScalarField> = tab.iter().map(|&x| x + alpha).collect();
-        batch_inverse(&mut tab_inv);
-        (tab, tab_inv)
-    };
-    let right_inputs = vec![
-        (&row_eq[..], beta_row, &group.count_row),
-        (&col_eq[..], beta_col, &group.count_col),
-        (&gamma_table[..], beta_pow, &group.count_pow),
-    ];
-    let right_tabs: Vec<(Vec<E::ScalarField>, Vec<E::ScalarField>)> = right_inputs
-        .par_iter()
-        .map(|(t, b, _)| build_right(t, *b))
+    let left_log_len = log2_ceil(group.len);
+    let left_dom = 1usize << left_log_len;
+    let mut p_leaf = vec![E::ScalarField::zero(); left_dom];
+    p_leaf[..group.len].fill(E::ScalarField::one());
+    let q_row_leaf: Vec<E::ScalarField> = (0..left_dom)
+        .map(|i| {
+            if i < group.len {
+                ele_row[i] + alpha
+            } else {
+                E::ScalarField::one()
+            }
+        })
         .collect();
-    timer.log("build right logup tables");
-    let tab_inv_polys: Vec<MlPoly<E::ScalarField>> = right_tabs
-        .iter()
-        .map(|(_, ti)| MlPoly::new(ti.clone()))
+    let q_col_leaf: Vec<E::ScalarField> = (0..left_dom)
+        .map(|i| {
+            if i < group.len {
+                ele_col[i] + alpha
+            } else {
+                E::ScalarField::one()
+            }
+        })
         .collect();
-    let tab_inv_commits: Vec<MkzgCommit<E>> = tab_inv_polys
-        .par_iter()
-        .map(|p| Mkzg::<E>::commit(kzg_pp, p))
+    let q_pow_leaf: Vec<E::ScalarField> = (0..left_dom)
+        .map(|i| {
+            if i < group.len {
+                ele_pow[i] + alpha
+            } else {
+                E::ScalarField::one()
+            }
+        })
         .collect();
-    for c in &tab_inv_commits {
-        proof.push_u(c.0.len());
-        proof.push_gs(&c.0);
-    }
-    timer.log("commit right inverse polys");
-    for ((tab, tab_inv), (tip, (_, _, count_poly))) in right_tabs
-        .into_iter()
-        .zip(tab_inv_polys.into_iter().zip(right_inputs.iter()))
-    {
-        let point_r =
-            logup_sumcheck_right::<E>(tab, tab_inv, count_poly.0.clone(), alpha, proof, ro);
-        acc.push(tip, point_r.clone());
-        acc.push((*count_poly).clone(), point_r);
-    }
-    timer.log("right logup sumchecks");
+
+    let row_left_point =
+        gkr_fractional_sum_prove::<E>(p_leaf.clone(), q_row_leaf, s_row, proof, ro);
+    let row_idx_v = group.row.clone().eval(&row_left_point);
+    let e_row_v = e_row_poly.clone().eval(&row_left_point);
+    proof.push_f(&[row_idx_v, e_row_v]);
+    acc.push(group.row.clone(), row_left_point.clone());
+    acc.push(e_row_poly.clone(), row_left_point);
+
+    let col_left_point =
+        gkr_fractional_sum_prove::<E>(p_leaf.clone(), q_col_leaf, s_col, proof, ro);
+    let col_idx_v = group.col.clone().eval(&col_left_point);
+    let e_col_v = e_col_poly.clone().eval(&col_left_point);
+    proof.push_f(&[col_idx_v, e_col_v]);
+    acc.push(group.col.clone(), col_left_point.clone());
+    acc.push(e_col_poly.clone(), col_left_point);
+
+    let pow_left_point = gkr_fractional_sum_prove::<E>(p_leaf, q_pow_leaf, s_pow, proof, ro);
+    let pow_idx_v = group.pow.clone().eval(&pow_left_point);
+    let e_gamma_v = e_gamma_poly.clone().eval(&pow_left_point);
+    proof.push_f(&[pow_idx_v, e_gamma_v]);
+    acc.push(group.pow.clone(), pow_left_point.clone());
+    acc.push(e_gamma_poly.clone(), pow_left_point);
+
+    let row_tab: Vec<E::ScalarField> = (0..(1usize << group.log_row))
+        .into_par_iter()
+        .map(|i| alpha + E::ScalarField::from(i as u64) + beta_row * row_eq[i])
+        .collect();
+    let col_tab: Vec<E::ScalarField> = (0..(1usize << group.log_col))
+        .into_par_iter()
+        .map(|i| alpha + E::ScalarField::from(i as u64) + beta_col * col_eq[i])
+        .collect();
+    let pow_tab: Vec<E::ScalarField> = (0..(1usize << group.log_pow))
+        .into_par_iter()
+        .map(|i| alpha + E::ScalarField::from(i as u64) + beta_pow * gamma_table[i])
+        .collect();
+
+    let row_right_point =
+        gkr_fractional_sum_prove::<E>(group.count_row.0.clone(), row_tab, s_row, proof, ro);
+    acc.push(group.count_row.clone(), row_right_point);
+
+    let col_right_point =
+        gkr_fractional_sum_prove::<E>(group.count_col.0.clone(), col_tab, s_col, proof, ro);
+    acc.push(group.count_col.clone(), col_right_point);
+
+    let pow_right_point =
+        gkr_fractional_sum_prove::<E>(group.count_pow.0.clone(), pow_tab, s_pow, proof, ro);
+    acc.push(group.count_pow.clone(), pow_right_point);
 }
 
 pub fn sparse_open<E: Pairing>(
@@ -1342,7 +1258,6 @@ pub fn sparse_open<E: Pairing>(
     proof: &mut Proof<E>,
     ro: &mut RandomOracle<E::ScalarField>,
 ) -> SparseEvals<E::ScalarField> {
-    let mut timer = DebugTimer::new("sparse_open");
     // Compute the 10 claimed MLE values directly.
     let row_eq_abc = MlPoly::new_eq(&point_abc.to_vec()).0;
     let row_eq_de = MlPoly::new_eq(&point_de.to_vec()).0;
@@ -1372,11 +1287,9 @@ pub fn sparse_open<E: Pairing>(
         d_pre: circuit.d.mle(&row_eq_de, &col_eq_pre, 0, wei_len, gamma),
         e_pre: circuit.e.mle(&row_eq_de, &col_eq_pre, 0, wei_len, gamma),
     };
-    timer.log("compute direct evals");
 
     // Push the 10 claimed values first.
     proof.push_f(&sparse_evals.as_array());
-    timer.log("push direct evals");
 
     let claim_array = sparse_evals.as_array();
     let mut acc = ProverAcc::<E::ScalarField>::new();
@@ -1386,7 +1299,6 @@ pub fn sparse_open<E: Pairing>(
     lasso_prove_supergroup::<E>(
         kzg_pp, sg, point_abc, point_de, point_suf, gamma, &claims, proof, ro, &mut acc,
     );
-    timer.log("prove suffix supergroup");
     prove_b_pre::<E>(
         kzg_pp,
         &polys.b_pre,
@@ -1398,14 +1310,12 @@ pub fn sparse_open<E: Pairing>(
         ro,
         &mut acc,
     );
-    timer.log("prove b_pre");
 
     let (kzg_proof, sumcheck_proof) = Mkzg::<E>::batch_open(kzg_pp, &acc.polys, &acc.points, ro);
     proof.push_u(kzg_proof.0.len());
     proof.push_gs(&kzg_proof.0);
     proof.push_u(sumcheck_proof.0.len());
     proof.push_f(&sumcheck_proof.0);
-    timer.log("final batch open");
 
     sparse_evals
 }
@@ -1489,105 +1399,85 @@ fn lasso_verify_supergroup<E: Pairing>(
     let beta_col = ro.next_field();
     let beta_pow = ro.next_field();
     let alpha = ro.next_field();
-    let rho = ro.next_field();
-
-    // Read ele_inv commits.
-    let eir_commit = read_commit(proof);
-    let eic_commit = read_commit(proof);
-    let eig_commit = read_commit(proof);
 
     let s_row = proof.next_f();
     let s_col = proof.next_f();
     let s_pow = proof.next_f();
-
-    // Combined logup-left verification.
-    let len_l = proof.next_u();
-    let nv_l = log2_ceil(len_l);
-    let r_eq_l = ro.next_n_fields(nv_l);
-    let r_sum_l = ro.next_field();
-    let rho2 = rho * rho;
-    let y0 = r_sum_l * (s_row + rho * s_col + rho2 * s_pow);
-    let (point_l, y_l) = verifier_sumcheck::<E>(y0, nv_l, 3, proof, ro);
-    let er_v = proof.next_f();
-    let eir_v = proof.next_f();
-    let ec_v = proof.next_f();
-    let eic_v = proof.next_f();
-    let eg_v = proof.next_f();
-    let eig_v = proof.next_f();
-    let eq_pref = MlPoly::eval_eq_pref(&r_eq_l, &point_l, len_l);
+    let left_log_len = log2_ceil(sg_commit.len);
     let one = E::ScalarField::one();
-    let combined_rhs =
-        ((er_v * eir_v - one) + rho * (ec_v * eic_v - one) + rho2 * (eg_v * eig_v - one)) * eq_pref
-            + r_sum_l * (eir_v + rho * eic_v + rho2 * eig_v);
-    assert_eq!(y_l, combined_rhs);
 
+    let (row_left_point, row_left_p, row_left_q) =
+        gkr_fractional_sum_verify::<E>(s_row, left_log_len, proof, ro);
     let row_idx_v = proof.next_f();
-    let col_idx_v = proof.next_f();
-    let pow_idx_v = proof.next_f();
     let e_row_v_l = proof.next_f();
+    let row_prefix_v = prefix_mle::<E::ScalarField>(&row_left_point, sg_commit.len);
+    assert_eq!(row_left_p, row_prefix_v);
+    assert_eq!(
+        row_left_q,
+        one + row_idx_v + beta_row * e_row_v_l + (alpha - one) * row_prefix_v
+    );
+    acc.push(sg_commit.row.clone(), row_left_point.clone(), row_idx_v);
+    acc.push(e_row_commit.clone(), row_left_point, e_row_v_l);
+
+    let (col_left_point, col_left_p, col_left_q) =
+        gkr_fractional_sum_verify::<E>(s_col, left_log_len, proof, ro);
+    let col_idx_v = proof.next_f();
     let e_col_v_l = proof.next_f();
+    let col_prefix_v = prefix_mle::<E::ScalarField>(&col_left_point, sg_commit.len);
+    assert_eq!(col_left_p, col_prefix_v);
+    assert_eq!(
+        col_left_q,
+        one + col_idx_v + beta_col * e_col_v_l + (alpha - one) * col_prefix_v
+    );
+    acc.push(sg_commit.col.clone(), col_left_point.clone(), col_idx_v);
+    acc.push(e_col_commit.clone(), col_left_point, e_col_v_l);
+
+    let (pow_left_point, pow_left_p, pow_left_q) =
+        gkr_fractional_sum_verify::<E>(s_pow, left_log_len, proof, ro);
+    let pow_idx_v = proof.next_f();
     let e_gamma_v_l = proof.next_f();
-
-    // ele_X = alpha * prefix_mle(T) + idx_X + beta_X * e_X.
-    let prefix_v = prefix_mle::<E::ScalarField>(&point_l, len_l);
-    assert_eq!(er_v, alpha * prefix_v + row_idx_v + beta_row * e_row_v_l);
-    assert_eq!(ec_v, alpha * prefix_v + col_idx_v + beta_col * e_col_v_l);
-    assert_eq!(eg_v, alpha * prefix_v + pow_idx_v + beta_pow * e_gamma_v_l);
-
-    acc.push(sg_commit.row.clone(), point_l.clone(), row_idx_v);
-    acc.push(sg_commit.col.clone(), point_l.clone(), col_idx_v);
-    acc.push(sg_commit.pow.clone(), point_l.clone(), pow_idx_v);
-    acc.push(e_row_commit, point_l.clone(), e_row_v_l);
-    acc.push(e_col_commit, point_l.clone(), e_col_v_l);
-    acc.push(e_gamma_commit, point_l.clone(), e_gamma_v_l);
-    acc.push(eir_commit, point_l.clone(), eir_v);
-    acc.push(eic_commit, point_l.clone(), eic_v);
-    acc.push(eig_commit, point_l, eig_v);
-
-    // Three memory-right verifications.
-    let tab_inv_row_commit = read_commit(proof);
-    let tab_inv_col_commit = read_commit(proof);
-    let tab_inv_gamma_commit = read_commit(proof);
-
-    // Row.
-    verify_memory_right::<E>(
-        proof,
-        ro,
-        alpha,
-        beta_row,
-        s_row,
-        sg_commit.log_row,
-        |pt| combined_row_mle::<E::ScalarField>(point_abc, point_de, pt),
-        tab_inv_row_commit,
-        sg_commit.count_row.clone(),
-        acc,
+    let pow_prefix_v = prefix_mle::<E::ScalarField>(&pow_left_point, sg_commit.len);
+    assert_eq!(pow_left_p, pow_prefix_v);
+    assert_eq!(
+        pow_left_q,
+        one + pow_idx_v + beta_pow * e_gamma_v_l + (alpha - one) * pow_prefix_v
     );
-    // Col.
-    verify_memory_right::<E>(
-        proof,
-        ro,
-        alpha,
-        beta_col,
-        s_col,
-        sg_commit.log_col,
-        |pt| MlPoly::<E::ScalarField>::eval_eq(&col_eq_point.to_vec(), &pt.to_vec()),
-        tab_inv_col_commit,
-        sg_commit.count_col.clone(),
-        acc,
+    acc.push(sg_commit.pow.clone(), pow_left_point.clone(), pow_idx_v);
+    acc.push(e_gamma_commit.clone(), pow_left_point, e_gamma_v_l);
+
+    let (row_right_point, row_count_v, row_tab_v) =
+        gkr_fractional_sum_verify::<E>(s_row, sg_commit.log_row, proof, ro);
+    assert_eq!(
+        row_tab_v,
+        alpha
+            + identity_mle::<E::ScalarField>(&row_right_point)
+            + beta_row * combined_row_mle::<E::ScalarField>(point_abc, point_de, &row_right_point)
     );
-    // Gamma.
-    verify_memory_right::<E>(
-        proof,
-        ro,
-        alpha,
-        beta_pow,
-        s_pow,
-        sg_commit.log_pow,
-        |pt| gamma_mle::<E::ScalarField>(pt, gamma),
-        tab_inv_gamma_commit,
-        sg_commit.count_pow.clone(),
-        acc,
+    acc.push(sg_commit.count_row.clone(), row_right_point, row_count_v);
+
+    let (col_right_point, col_count_v, col_tab_v) =
+        gkr_fractional_sum_verify::<E>(s_col, sg_commit.log_col, proof, ro);
+    assert_eq!(
+        col_tab_v,
+        alpha
+            + identity_mle::<E::ScalarField>(&col_right_point)
+            + beta_col
+                * MlPoly::<E::ScalarField>::eval_eq(
+                    &col_eq_point.to_vec(),
+                    &col_right_point.to_vec()
+                )
     );
+    acc.push(sg_commit.count_col.clone(), col_right_point, col_count_v);
+
+    let (pow_right_point, pow_count_v, pow_tab_v) =
+        gkr_fractional_sum_verify::<E>(s_pow, sg_commit.log_pow, proof, ro);
+    assert_eq!(
+        pow_tab_v,
+        alpha
+            + identity_mle::<E::ScalarField>(&pow_right_point)
+            + beta_pow * gamma_mle::<E::ScalarField>(&pow_right_point, gamma)
+    );
+    acc.push(sg_commit.count_pow.clone(), pow_right_point, pow_count_v);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1630,133 +1520,89 @@ fn verify_b_pre<E: Pairing>(
     let beta_col = ro.next_field();
     let beta_pow = ro.next_field();
     let alpha = ro.next_field();
-    let rho = ro.next_field();
-
-    let ei_row_commit = read_commit(proof);
-    let ei_col_commit = read_commit(proof);
-    let ei_pow_commit = read_commit(proof);
 
     let s_row = proof.next_f();
     let s_col = proof.next_f();
     let s_pow = proof.next_f();
-
-    let len_l = proof.next_u();
-    let nv_l = log2_ceil(len_l);
-    let r_eq_l = ro.next_n_fields(nv_l);
-    let r_sum_l = ro.next_field();
-    let rho2 = rho * rho;
-    let y0 = r_sum_l * (s_row + rho * s_col + rho2 * s_pow);
-    let (point_l, y_l) = verifier_sumcheck::<E>(y0, nv_l, 3, proof, ro);
-    let e0_v = proof.next_f();
-    let ei0_v = proof.next_f();
-    let e1_v = proof.next_f();
-    let ei1_v = proof.next_f();
-    let e2_v = proof.next_f();
-    let ei2_v = proof.next_f();
-    let eq_pref = MlPoly::eval_eq_pref(&r_eq_l, &point_l, len_l);
+    let left_log_len = log2_ceil(commit.len);
     let one = E::ScalarField::one();
-    let rhs = ((e0_v * ei0_v - one) + rho * (e1_v * ei1_v - one) + rho2 * (e2_v * ei2_v - one))
-        * eq_pref
-        + r_sum_l * (ei0_v + rho * ei1_v + rho2 * ei2_v);
-    assert_eq!(y_l, rhs);
 
+    let (row_left_point, row_left_p, row_left_q) =
+        gkr_fractional_sum_verify::<E>(s_row, left_log_len, proof, ro);
     let row_idx_v = proof.next_f();
-    let col_idx_v = proof.next_f();
-    let pow_idx_v = proof.next_f();
     let e_row_v_l = proof.next_f();
-    let e_col_v_l = proof.next_f();
-    let e_gamma_v_l = proof.next_f();
-
-    let prefix_v = prefix_mle::<E::ScalarField>(&point_l, len_l);
-    assert_eq!(e0_v, alpha * prefix_v + row_idx_v + beta_row * e_row_v_l);
-    assert_eq!(e1_v, alpha * prefix_v + col_idx_v + beta_col * e_col_v_l);
-    assert_eq!(e2_v, alpha * prefix_v + pow_idx_v + beta_pow * e_gamma_v_l);
-
-    acc.push(commit.row.clone(), point_l.clone(), row_idx_v);
-    acc.push(commit.col.clone(), point_l.clone(), col_idx_v);
-    acc.push(commit.pow.clone(), point_l.clone(), pow_idx_v);
-    acc.push(e_row_commit, point_l.clone(), e_row_v_l);
-    acc.push(e_col_commit, point_l.clone(), e_col_v_l);
-    acc.push(e_gamma_commit, point_l.clone(), e_gamma_v_l);
-    acc.push(ei_row_commit, point_l.clone(), ei0_v);
-    acc.push(ei_col_commit, point_l.clone(), ei1_v);
-    acc.push(ei_pow_commit, point_l, ei2_v);
-
-    let tab_inv_row_commit = read_commit(proof);
-    let tab_inv_col_commit = read_commit(proof);
-    let tab_inv_pow_commit = read_commit(proof);
-
-    verify_memory_right::<E>(
-        proof,
-        ro,
-        alpha,
-        beta_row,
-        s_row,
-        commit.log_row,
-        |pt| MlPoly::<E::ScalarField>::eval_eq(&row_eq_point.to_vec(), &pt.to_vec()),
-        tab_inv_row_commit,
-        commit.count_row.clone(),
-        acc,
-    );
-    verify_memory_right::<E>(
-        proof,
-        ro,
-        alpha,
-        beta_col,
-        s_col,
-        commit.log_col,
-        |pt| MlPoly::<E::ScalarField>::eval_eq(&col_eq_point.to_vec(), &pt.to_vec()),
-        tab_inv_col_commit,
-        commit.count_col.clone(),
-        acc,
-    );
-    verify_memory_right::<E>(
-        proof,
-        ro,
-        alpha,
-        beta_pow,
-        s_pow,
-        commit.log_pow,
-        |pt| gamma_mle::<E::ScalarField>(pt, gamma),
-        tab_inv_pow_commit,
-        commit.count_pow.clone(),
-        acc,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn verify_memory_right<E: Pairing>(
-    proof: &mut Proof<E>,
-    ro: &mut RandomOracle<E::ScalarField>,
-    alpha: E::ScalarField,
-    beta: E::ScalarField,
-    claim_s: E::ScalarField,
-    log_n: usize,
-    table_mle_at: impl Fn(&[E::ScalarField]) -> E::ScalarField,
-    tab_inv_commit: MkzgCommit<E>,
-    count_commit: MkzgCommit<E>,
-    acc: &mut VerifierAcc<E>,
-) {
-    let len_r = proof.next_u();
-    let nv_r = log2_ceil(len_r);
-    assert_eq!(nv_r, log_n);
-    let r_eq = ro.next_n_fields(nv_r);
-    let r_sum = ro.next_field();
-    let (point_r, y_r) = verifier_sumcheck::<E>(claim_s * r_sum, nv_r, 3, proof, ro);
-    let tab_v = proof.next_f();
-    let tab_inv_v = proof.next_f();
-    let count_v = proof.next_f();
-    let eq_pref = MlPoly::eval_eq_pref(&r_eq, &point_r, len_r);
+    let row_prefix_v = prefix_mle::<E::ScalarField>(&row_left_point, commit.len);
+    assert_eq!(row_left_p, row_prefix_v);
     assert_eq!(
-        y_r,
-        (tab_v * tab_inv_v - E::ScalarField::one()) * eq_pref + r_sum * tab_inv_v * count_v
+        row_left_q,
+        one + row_idx_v + beta_row * e_row_v_l + (alpha - one) * row_prefix_v
     );
-    let expected_tab_v =
-        alpha + identity_mle::<E::ScalarField>(&point_r) + beta * table_mle_at(&point_r);
-    assert_eq!(tab_v, expected_tab_v);
+    acc.push(commit.row.clone(), row_left_point.clone(), row_idx_v);
+    acc.push(e_row_commit.clone(), row_left_point, e_row_v_l);
 
-    acc.push(tab_inv_commit, point_r.clone(), tab_inv_v);
-    acc.push(count_commit, point_r, count_v);
+    let (col_left_point, col_left_p, col_left_q) =
+        gkr_fractional_sum_verify::<E>(s_col, left_log_len, proof, ro);
+    let col_idx_v = proof.next_f();
+    let e_col_v_l = proof.next_f();
+    let col_prefix_v = prefix_mle::<E::ScalarField>(&col_left_point, commit.len);
+    assert_eq!(col_left_p, col_prefix_v);
+    assert_eq!(
+        col_left_q,
+        one + col_idx_v + beta_col * e_col_v_l + (alpha - one) * col_prefix_v
+    );
+    acc.push(commit.col.clone(), col_left_point.clone(), col_idx_v);
+    acc.push(e_col_commit.clone(), col_left_point, e_col_v_l);
+
+    let (pow_left_point, pow_left_p, pow_left_q) =
+        gkr_fractional_sum_verify::<E>(s_pow, left_log_len, proof, ro);
+    let pow_idx_v = proof.next_f();
+    let e_gamma_v_l = proof.next_f();
+    let pow_prefix_v = prefix_mle::<E::ScalarField>(&pow_left_point, commit.len);
+    assert_eq!(pow_left_p, pow_prefix_v);
+    assert_eq!(
+        pow_left_q,
+        one + pow_idx_v + beta_pow * e_gamma_v_l + (alpha - one) * pow_prefix_v
+    );
+    acc.push(commit.pow.clone(), pow_left_point.clone(), pow_idx_v);
+    acc.push(e_gamma_commit.clone(), pow_left_point, e_gamma_v_l);
+
+    let (row_right_point, row_count_v, row_tab_v) =
+        gkr_fractional_sum_verify::<E>(s_row, commit.log_row, proof, ro);
+    assert_eq!(
+        row_tab_v,
+        alpha
+            + identity_mle::<E::ScalarField>(&row_right_point)
+            + beta_row
+                * MlPoly::<E::ScalarField>::eval_eq(
+                    &row_eq_point.to_vec(),
+                    &row_right_point.to_vec()
+                )
+    );
+    acc.push(commit.count_row.clone(), row_right_point, row_count_v);
+
+    let (col_right_point, col_count_v, col_tab_v) =
+        gkr_fractional_sum_verify::<E>(s_col, commit.log_col, proof, ro);
+    assert_eq!(
+        col_tab_v,
+        alpha
+            + identity_mle::<E::ScalarField>(&col_right_point)
+            + beta_col
+                * MlPoly::<E::ScalarField>::eval_eq(
+                    &col_eq_point.to_vec(),
+                    &col_right_point.to_vec()
+                )
+    );
+    acc.push(commit.count_col.clone(), col_right_point, col_count_v);
+
+    let (pow_right_point, pow_count_v, pow_tab_v) =
+        gkr_fractional_sum_verify::<E>(s_pow, commit.log_pow, proof, ro);
+    assert_eq!(
+        pow_tab_v,
+        alpha
+            + identity_mle::<E::ScalarField>(&pow_right_point)
+            + beta_pow * gamma_mle::<E::ScalarField>(&pow_right_point, gamma)
+    );
+    acc.push(commit.count_pow.clone(), pow_right_point, pow_count_v);
 }
 
 pub fn sparse_verify<E: Pairing>(
