@@ -2,6 +2,7 @@ use std::cmp;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use ark_bn254::{Bn254, Fr};
 use ark_ff::{AdditiveGroup, UniformRand};
@@ -374,6 +375,9 @@ fn main() {
     let mut ro = RandomOracle::new(&mut rng);
     let proof = prover.prove(z, gamma, &mut ro);
     let verifier = Verifier::new(vk);
+    let verifier_start = Instant::now();
     verifier.verify(proof, gamma, &mut ro);
+    let verifier_time = verifier_start.elapsed().as_millis();
+    println!("verifier_time = {} ms", verifier_time);
     println!("proof verified");
 }

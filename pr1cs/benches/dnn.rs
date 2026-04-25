@@ -6,6 +6,7 @@ use pr1cs::verifier::Verifier;
 use pr1cs::{circuit::LookupType, instruction::Instruction, program::Program};
 use rand::thread_rng;
 use std::cmp;
+use std::time::Instant;
 use util::kzg::{Mkzg, LOG_CHUNK_SIZE};
 use util::util::RandomOracle;
 
@@ -100,6 +101,9 @@ fn main() {
     let proof = prover.prove(z, gamma, &mut ro);
     let verifier = Verifier::new(vk);
     let _ = weight_len;
+    let verifier_start = Instant::now();
     verifier.verify(proof, gamma, &mut ro);
+    let verifier_time = verifier_start.elapsed().as_millis();
+    println!("verifier_time = {} ms", verifier_time);
     println!("finish DNN!")
 }

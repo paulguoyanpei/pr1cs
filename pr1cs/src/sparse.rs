@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use util::{
     kzg::{Mkzg, MkzgCommit, MkzgProof, MkzgProveParams, MkzgVerParams, SumcheckProof},
     poly::MlPoly,
-    util::{Proof, RandomOracle, batch_inverse},
+    util::{batch_inverse, Proof, RandomOracle},
 };
 
 use crate::circuit::{Circuit, SparseMatrix};
