@@ -151,9 +151,10 @@ mod tests {
                 start1: weights.len(),
                 start2: 1,
             },
-            Instruction::Quant {
+            Instruction::Div {
                 input1: vec![(weights.len() + input.len(), 1)],
                 input2: vec![(0, 1)],
+                divisor: 64,
             },
             Instruction::Lookup {
                 input: vec![(weights.len() + input.len() + 2, 1)],
@@ -162,9 +163,20 @@ mod tests {
         ];
         let program = Program::<Fr>::new(instructions, weights);
         let trace = program.execute(input.clone());
-        let table = (-64i64..=64)
-            .map(|i| (Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2u64)))
+        let mut table = (0i64..64)
+            .map(|i| {
+                (
+                    Fr::from(0),
+                    Fr::from(i),
+                    Fr::from(LookupType::Range(64).tag()),
+                )
+            })
             .collect::<Vec<_>>();
+        table.extend(
+            (-64i64..=64)
+                .map(|i| (Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2u64)))
+                .collect::<Vec<_>>(),
+        );
         program.to_circuit(input.len(), trace.len(), table)
     }
 

@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{collections::HashMap, marker::PhantomData};
 
 use ark_ff::PrimeField;
 
@@ -10,7 +10,27 @@ use crate::{
 pub struct Program<F: PrimeField> {
     instructions: Vec<Instruction>,
     weights: Vec<i64>,
+    lookup_tables: HashMap<LookupType, LookupTable>,
     _pd: PhantomData<F>,
+}
+
+#[derive(Clone)]
+pub struct LookupTable {
+    min: i64,
+    values: Vec<i64>,
+}
+
+impl LookupTable {
+    pub fn new(min: i64, values: Vec<i64>) -> Self {
+        assert!(!values.is_empty());
+        Self { min, values }
+    }
+
+    pub fn lookup(&self, input: i64) -> i64 {
+        let max = self.min + self.values.len() as i64 - 1;
+        let clamped = input.clamp(self.min, max);
+        self.values[(clamped - self.min) as usize]
+    }
 }
 
 impl<F: PrimeField> Program<F> {
@@ -18,6 +38,20 @@ impl<F: PrimeField> Program<F> {
         Program {
             instructions,
             weights,
+            lookup_tables: HashMap::new(),
+            _pd: PhantomData::default(),
+        }
+    }
+
+    pub fn new_with_lookup_tables(
+        instructions: Vec<Instruction>,
+        weights: Vec<i64>,
+        lookup_tables: HashMap<LookupType, LookupTable>,
+    ) -> Self {
+        Program {
+            instructions,
+            weights,
+            lookup_tables,
             _pd: PhantomData::default(),
         }
     }
@@ -135,13 +169,19 @@ impl<F: PrimeField> Program<F> {
                     tp.push(lookup_type.clone());
                     output_index += 1
                 }
-                &Instruction::Quant { input1, input2 } => {
+                &Instruction::Div {
+                    input1,
+                    input2,
+                    divisor,
+                } => {
+                    let divisor = *divisor;
+                    assert!(divisor > 0);
                     a.append(input1);
                     b.append(input2);
-                    c.append(&vec![(output_index, (1 << 6)), (auxiliary_index, 1)]);
+                    c.append(&vec![(output_index, divisor), (auxiliary_index, 1)]);
                     d.append(&vec![]);
                     e.append(&vec![(auxiliary_index, 1)]);
-                    tp.push(LookupType::Ge0);
+                    tp.push(LookupType::Range(divisor));
 
                     output_index += 1;
                     auxiliary_index += 1
@@ -226,7 +266,7 @@ impl<F: PrimeField> Program<F> {
         self.weights.iter().map(|&x| F::from(x)).collect()
     }
 
-    pub fn execute(&self, mut input: Vec<i64>) -> Vec<F> {
+    pub fn execute_i64(&self, mut input: Vec<i64>) -> Vec<i64> {
         // execute the prgram, generate the whole traces
         let mut z = self.weights.clone();
         z.append(&mut input);
@@ -297,19 +337,30 @@ impl<F: PrimeField> Program<F> {
                         a += z[i.0] * i.1
                     }
                     match tp {
-                        LookupType::Ge0 => panic!(),
+                        LookupType::Range(_) => panic!(),
                         LookupType::Relu => {
-                            assert!(a < (1 << 16));
-                            assert!(a > -(1 << 16));
                             if a >= 0 {
                                 z.push(a);
                             } else {
                                 z.push(0);
                             }
                         }
+                        _ => {
+                            let table = self
+                                .lookup_tables
+                                .get(tp)
+                                .unwrap_or_else(|| panic!("missing lookup table for {:?}", tp));
+                            z.push(table.lookup(a));
+                        }
                     }
                 }
-                &Instruction::Quant { input1, input2 } => {
+                &Instruction::Div {
+                    input1,
+                    input2,
+                    divisor,
+                } => {
+                    let divisor = *divisor;
+                    assert!(divisor > 0);
                     let mut a = 0;
                     for i in input1 {
                         a += z[i.0] * i.1
@@ -319,7 +370,7 @@ impl<F: PrimeField> Program<F> {
                         b += z[i.0] * i.1
                     }
                     let c = a * b;
-                    z.push(c >> 6);
+                    z.push(c.div_euclid(divisor));
                 }
                 &Instruction::MatMult {
                     m,
@@ -362,7 +413,14 @@ impl<F: PrimeField> Program<F> {
             }
         }
 
-        z.iter().map(|&x| F::from(x)).collect::<Vec<_>>()
+        z
+    }
+
+    pub fn execute(&self, input: Vec<i64>) -> Vec<F> {
+        self.execute_i64(input)
+            .iter()
+            .map(|&x| F::from(x))
+            .collect::<Vec<_>>()
     }
 
     pub fn gen_z(&self, output_start: usize, trace: Vec<F>, gamma: F) -> Vec<F> {
@@ -429,8 +487,14 @@ impl<F: PrimeField> Program<F> {
                 &Instruction::Lookup { input: _, tp: _ } => {
                     output_index += 1;
                 }
-                &Instruction::Quant { input1, input2 } => {
-                    // add the remnant r st <A[cr],z> * <B[cr],z> = 2**6 * z[or] + r
+                &Instruction::Div {
+                    input1,
+                    input2,
+                    divisor,
+                } => {
+                    let divisor = *divisor;
+                    assert!(divisor > 0);
+                    // add the remnant r st <A[cr],z> * <B[cr],z> = divisor * z[or] + r
                     let mut a = F::zero();
                     for i in input1 {
                         a += trace[i.0] * F::from(i.1);
@@ -440,7 +504,7 @@ impl<F: PrimeField> Program<F> {
                         b += trace[i.0] * F::from(i.1);
                     }
                     let c = a * b;
-                    let r = c - F::from(1 << 6) * trace[output_index];
+                    let r = c - F::from(divisor) * trace[output_index];
 
                     aux.push(r);
                     output_index += 1;
@@ -536,6 +600,35 @@ mod tests {
         }
 
         out
+    }
+
+    #[test]
+    fn div_instruction_matches_floor_division() {
+        let weights = vec![1];
+        let input = vec![-65, 65, 8191, 8192, 383, 384];
+        let instructions = vec![
+            Instruction::Div {
+                input1: vec![(weights.len(), 1)],
+                input2: vec![(0, 1)],
+                divisor: 64,
+            },
+            Instruction::Div {
+                input1: vec![(weights.len() + 2, 1)],
+                input2: vec![(0, 1)],
+                divisor: 4096,
+            },
+            Instruction::Div {
+                input1: vec![(weights.len() + 4, 1)],
+                input2: vec![(0, 1)],
+                divisor: 192,
+            },
+        ];
+        let program = Program::<Fr>::new(instructions, weights.clone());
+        let trace = program.execute(input.clone());
+        let out = weights.len() + input.len();
+        assert_eq!(trace[out], Fr::from((-65i64).div_euclid(64)));
+        assert_eq!(trace[out + 1], Fr::from(8191i64.div_euclid(4096)));
+        assert_eq!(trace[out + 2], Fr::from(383i64.div_euclid(192)));
     }
 
     #[test]

@@ -182,24 +182,25 @@ fn build_program(weight_len: usize, input_len: usize, plan: &WeightPlan) -> Prog
                 });
                 next_slot += cout * conv_plane;
 
-                // Quant the center n x n of each output channel (discard the
-                // (n+2)x(n+2) border). Order them (d, i, j) so that the Quant
+                // Div the center n x n of each output channel (discard the
+                // (n+2)x(n+2) border). Order them (d, i, j) so that the Div
                 // block is a contiguous (cout, side, side) feature map.
                 let quant_start = next_slot;
                 for d in 0..cout {
                     for i in 0..side {
                         for j in 0..side {
                             let src = conv_start + d * conv_plane + (i + 1) * conv_side + (j + 1);
-                            instructions.push(Instruction::Quant {
+                            instructions.push(Instruction::Div {
                                 input1: vec![(src, 1)],
                                 input2: vec![(0, 1)],
+                                divisor: 64,
                             });
                             next_slot += 1;
                         }
                     }
                 }
 
-                // ReLU (table lookup) on the Quant outputs; same (d, i, j)
+                // ReLU (table lookup) on the Div outputs; same (d, i, j)
                 // ordering so the ReLU block is a contiguous feature map.
                 let relu_start = next_slot;
                 for d in 0..cout {
@@ -358,7 +359,7 @@ fn main() {
 
     let mut table = vec![];
     for i in 0..(1 << 6) {
-        table.push((Fr::ZERO, Fr::from(i), Fr::from(1)));
+        table.push((Fr::ZERO, Fr::from(i), Fr::from(LookupType::Range(64).tag())));
     }
     for i in (-(1 << 16) + 1)..(1 << 16) {
         table.push((Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2)));

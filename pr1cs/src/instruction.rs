@@ -1,5 +1,6 @@
 use crate::circuit::LookupType;
 
+#[derive(Clone)]
 pub enum Instruction {
     AddMult {
         input1: Vec<(usize, i64)>,
@@ -17,9 +18,10 @@ pub enum Instruction {
         input: Vec<(usize, i64)>,
         tp: LookupType,
     },
-    Quant {
+    Div {
         input1: Vec<(usize, i64)>,
         input2: Vec<(usize, i64)>,
+        divisor: i64,
     },
     MatMult {
         m: usize,

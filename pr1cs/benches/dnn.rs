@@ -31,9 +31,10 @@ fn instructions(weight_len: usize) -> Vec<Instruction> {
 
         let matmul_start = input_start + INPUT_ALIGN;
         for offset in 0..INPUT_ALIGN {
-            instructions.push(Instruction::Quant {
+            instructions.push(Instruction::Div {
                 input1: vec![(matmul_start + offset, 1)],
                 input2: vec![(0, 1)],
+                divisor: 64,
             });
         }
 
@@ -85,7 +86,7 @@ fn main() {
 
     let mut table = vec![];
     for i in 0..(1 << 6) {
-        table.push((Fr::ZERO, Fr::from(i), Fr::from(1)));
+        table.push((Fr::ZERO, Fr::from(i), Fr::from(LookupType::Range(64).tag())));
     }
     for i in (-(1 << 16) + 1)..(1 << 16) {
         table.push((Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2)));

@@ -19,3 +19,7 @@ harness = false
 [[bench]]
 name = "vgg16"
 harness = false
+
+[[bench]]
+name = "vit"
+harness = false

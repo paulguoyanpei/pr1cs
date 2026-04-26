@@ -1,10 +1,30 @@
 use ark_ff::PrimeField;
 use std::collections::HashSet;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LookupType {
-    Ge0,
+    Range(i64),
     Relu,
+    Gelu,
+    Exp,
+    Recip,
+    Rsqrt,
+}
+
+impl LookupType {
+    pub fn tag(self) -> i64 {
+        match self {
+            LookupType::Range(divisor) => {
+                assert!(divisor > 0);
+                -divisor
+            }
+            LookupType::Relu => 2,
+            LookupType::Gelu => 3,
+            LookupType::Exp => 4,
+            LookupType::Recip => 5,
+            LookupType::Rsqrt => 6,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -170,13 +190,7 @@ impl<F: PrimeField> Circuit<F> {
             c,
             d,
             e,
-            tp: tp
-                .into_iter()
-                .map(|x| match x {
-                    LookupType::Ge0 => F::from(1),
-                    LookupType::Relu => F::from(2),
-                })
-                .collect(),
+            tp: tp.into_iter().map(|x| F::from(x.tag())).collect(),
             weights,
             weight_len,
             z_len,
@@ -202,21 +216,11 @@ impl<F: PrimeField> Circuit<F> {
         let set = self.table.clone().into_iter().collect::<HashSet<_>>();
 
         for cr in 0..self.d.len() {
-            if self.tp[cr] == F::from(1) {
-                assert!(set.contains(&(
-                    self.d.mult_vec_at(cr, &z, gamma),
-                    self.e.mult_vec_at(cr, &z, gamma),
-                    F::from(1)
-                )))
-            } else if self.tp[cr] == F::from(2) {
-                assert!(set.contains(&(
-                    self.d.mult_vec_at(cr, &z, gamma),
-                    self.e.mult_vec_at(cr, &z, gamma),
-                    F::from(2)
-                )))
-            } else {
-                panic!("undefined lookup type")
-            }
+            assert!(set.contains(&(
+                self.d.mult_vec_at(cr, &z, gamma),
+                self.e.mult_vec_at(cr, &z, gamma),
+                self.tp[cr]
+            )))
         }
         return true;
     }
