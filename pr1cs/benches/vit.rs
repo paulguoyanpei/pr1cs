@@ -66,16 +66,27 @@ struct Weights {
 struct Builder {
     instructions: Vec<Instruction>,
     next: usize,
+    weight_len: usize,
+    one_idx: usize,
     marks: Vec<(String, usize, usize)>,
 }
 
 impl Builder {
     fn new(weight_len: usize, input_len: usize) -> Self {
+        assert!(input_len > 0);
         Self {
             instructions: Vec::new(),
             next: weight_len + input_len,
+            weight_len,
+            one_idx: weight_len + input_len - 1,
             marks: Vec::new(),
         }
+    }
+
+    fn has_prefix(&self, terms: &[(usize, i64)]) -> bool {
+        terms
+            .iter()
+            .any(|&(idx, coeff)| coeff != 0 && idx < self.weight_len)
     }
 
     fn mark(&mut self, name: impl Into<String>, start: usize, len: usize) {
@@ -85,8 +96,8 @@ impl Builder {
     fn add(&mut self, input1: Vec<(usize, i64)>) -> usize {
         let out = self.next;
         self.instructions.push(Instruction::AddMult {
-            input1,
-            input2: vec![(0, 1)],
+            input1: vec![(self.one_idx, 1)],
+            input2: input1,
         });
         self.next += 1;
         out
@@ -94,11 +105,25 @@ impl Builder {
 
     fn div(&mut self, input1: Vec<(usize, i64)>, input2: Vec<(usize, i64)>, divisor: i64) -> usize {
         let out = self.next;
-        self.instructions.push(Instruction::Div {
-            input1,
-            input2,
-            divisor,
-        });
+        if input2 == vec![(0, 1)] {
+            self.instructions.push(Instruction::Div {
+                input1: vec![(self.one_idx, 1)],
+                input2: input1,
+                divisor,
+            });
+        } else if self.has_prefix(&input1) && !self.has_prefix(&input2) {
+            self.instructions.push(Instruction::Div {
+                input1: input2,
+                input2: input1,
+                divisor,
+            });
+        } else {
+            self.instructions.push(Instruction::Div {
+                input1,
+                input2,
+                divisor,
+            });
+        }
         self.next += 1;
         out
     }
@@ -227,7 +252,10 @@ impl Builder {
 
         let rsqrt = self.next;
         for t in 0..tokens {
-            self.lookup(vec![(var_q + t, 1), (0, EPS_INT)], LookupType::Rsqrt);
+            self.lookup(
+                vec![(var_q + t, 1), (self.one_idx, EPS_INT)],
+                LookupType::Rsqrt,
+            );
         }
 
         let normed = self.next;
@@ -436,7 +464,7 @@ impl Builder {
             C as i64,
         );
         let var_q = self.div(vec![(var_2q, 1)], vec![(0, 1)], SCALE);
-        let rsqrt = self.lookup(vec![(var_q, 1), (0, EPS_INT)], LookupType::Rsqrt);
+        let rsqrt = self.lookup(vec![(var_q, 1), (self.one_idx, EPS_INT)], LookupType::Rsqrt);
 
         let normed = self.next;
         for f in 0..C {
@@ -571,23 +599,26 @@ fn build_program(
     let mut b = Builder::new(weights.buf.len(), input_len);
 
     let input_start = weights.buf.len();
-    let mut cur = 0;
+    let embedded = b.next;
+    for f in 0..C {
+        for t in 0..N {
+            let terms = if t == 0 {
+                vec![(weights.cls + f, 1), (weights.pos + f, 1)]
+            } else {
+                vec![
+                    (input_start + (t - 1) * C + f, 1),
+                    (weights.pos + t * C + f, 1),
+                ]
+            };
+            b.add(terms);
+        }
+    }
+    b.mark("embedded", embedded, C * N);
+
+    let mut cur = embedded;
     for (idx, block) in weights.blocks.iter().enumerate() {
         cur = if idx == 0 {
-            b.block_expr(
-                |f, t| {
-                    if t == 0 {
-                        vec![(weights.cls + f, 1), (weights.pos + f, 1)]
-                    } else {
-                        vec![
-                            (input_start + (t - 1) * C + f, 1),
-                            (weights.pos + t * C + f, 1),
-                        ]
-                    }
-                },
-                block,
-                true,
-            )
+            b.block(cur, block, true)
         } else {
             b.block(cur, block, false)
         };
@@ -724,8 +755,9 @@ fn check_lookup_coverage(
 
 fn main() {
     let weights = load_weights();
-    let input = read_i64_bin(&data_path("vit_input_embedded.bin"));
+    let mut input = read_i64_bin(&data_path("vit_input_embedded.bin"));
     assert_eq!(input.len(), N_PATCH * C);
+    input.push(1);
 
     let start = Instant::now();
     let (instructions, logits_start, trace_len, marks) = build_program(&weights, input.len());
@@ -777,6 +809,7 @@ fn main() {
     let prover = Prover::new(pk);
     let mut ro = RandomOracle::new(&mut rng);
     let proof = prover.prove(z, gamma, &mut ro);
+    println!("proof size {} bytes", proof.size());
 
     let verifier = Verifier::new(vk);
     let verifier_start = Instant::now();

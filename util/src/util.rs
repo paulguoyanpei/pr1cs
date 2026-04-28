@@ -1,5 +1,6 @@
 use ark_ec::pairing::Pairing;
 use ark_ff::{Field, PrimeField, UniformRand};
+use ark_serialize::{CanonicalSerialize, Compress};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
 pub struct Proof<E: Pairing> {
@@ -41,6 +42,11 @@ impl<E: Pairing> Proof<E> {
         for i in gs {
             self.g.push(*i);
         }
+    }
+
+    pub fn size(&self) -> usize {
+        self.f.len() * self.f[0].serialized_size(Compress::Yes)
+            + self.g.len() * self.g[0].serialized_size(Compress::Yes)
     }
 
     pub fn next_f(&mut self) -> E::ScalarField {

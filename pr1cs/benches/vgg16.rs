@@ -375,6 +375,7 @@ fn main() {
     let prover = Prover::new(pk);
     let mut ro = RandomOracle::new(&mut rng);
     let proof = prover.prove(z, gamma, &mut ro);
+    println!("proof size {} bytes", proof.size());
     let verifier = Verifier::new(vk);
     let verifier_start = Instant::now();
     verifier.verify(proof, gamma, &mut ro);
