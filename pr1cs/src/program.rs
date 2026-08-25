@@ -3,7 +3,7 @@ use std::{collections::HashMap, marker::PhantomData};
 use ark_ff::PrimeField;
 
 use crate::{
-    circuit::{Circuit, LookupType, SparseMatrix},
+    circuit::{Circuit, LookupType, SparseMatrix, QUOTIENT_BOUND},
     instruction::Instruction,
 };
 
@@ -183,6 +183,12 @@ impl<F: PrimeField> Program<F> {
                     e.append(&vec![(auxiliary_index, 1)]);
                     tp.push(LookupType::Range(divisor));
 
+                    // The remainder check alone leaves `divisor` valid choices
+                    // of quotient, so pin the quotient down too.
+                    d.append(&vec![]);
+                    e.append(&vec![(output_index, 1)]);
+                    tp.push(LookupType::Bound(QUOTIENT_BOUND));
+
                     output_index += 1;
                     auxiliary_index += 1
                 }
@@ -336,21 +342,19 @@ impl<F: PrimeField> Program<F> {
                     for i in input {
                         a += z[i.0] * i.1
                     }
-                    match tp {
-                        LookupType::Range(_) => panic!(),
-                        LookupType::Relu => {
-                            if a >= 0 {
-                                z.push(a);
-                            } else {
-                                z.push(0);
+                    if let Some(v) = tp.eval(a) {
+                        z.push(v);
+                    } else {
+                        match tp {
+                            // Emitted only by `Div`, never as a standalone Lookup.
+                            LookupType::Range(_) | LookupType::Bound(_) => panic!(),
+                            _ => {
+                                let table = self
+                                    .lookup_tables
+                                    .get(tp)
+                                    .unwrap_or_else(|| panic!("missing lookup table for {:?}", tp));
+                                z.push(table.lookup(a));
                             }
-                        }
-                        _ => {
-                            let table = self
-                                .lookup_tables
-                                .get(tp)
-                                .unwrap_or_else(|| panic!("missing lookup table for {:?}", tp));
-                            z.push(table.lookup(a));
                         }
                     }
                 }
@@ -370,7 +374,15 @@ impl<F: PrimeField> Program<F> {
                         b += z[i.0] * i.1
                     }
                     let c = a * b;
-                    z.push(c.div_euclid(divisor));
+                    let q = c.div_euclid(divisor);
+                    assert!(
+                        (-QUOTIENT_BOUND..QUOTIENT_BOUND).contains(&q),
+                        "Div quotient {} escapes the range check [{}, {})",
+                        q,
+                        -QUOTIENT_BOUND,
+                        QUOTIENT_BOUND
+                    );
+                    z.push(q);
                 }
                 &Instruction::MatMult {
                     m,
@@ -629,6 +641,36 @@ mod tests {
         assert_eq!(trace[out], Fr::from((-65i64).div_euclid(64)));
         assert_eq!(trace[out + 1], Fr::from(8191i64.div_euclid(4096)));
         assert_eq!(trace[out + 2], Fr::from(383i64.div_euclid(192)));
+    }
+
+    #[test]
+    fn div_relu_lookup_fuses_div_and_relu() {
+        let weights = vec![1];
+        // Negative inputs must clamp to 0 regardless of how the division
+        // rounds, which is what lets DivRelu replace a Div followed by a Relu.
+        let input = vec![-65, -1, 0, 63, 64, 8191];
+        let instructions: Vec<Instruction> = (0..input.len())
+            .map(|i| Instruction::Lookup {
+                input: vec![(weights.len() + i, 1)],
+                tp: LookupType::DivRelu(64),
+            })
+            .collect();
+        let program = Program::<Fr>::new(instructions, weights.clone());
+        let trace = program.execute_i64(input.clone());
+        let out = weights.len() + input.len();
+        assert_eq!(&trace[out..], &[0, 0, 0, 0, 1, 127]);
+
+        // Scaling the input by the divisor turns the same table into a plain
+        // ReLU, which is how max-pooling reuses it.
+        let scaled: Vec<Instruction> = (0..input.len())
+            .map(|i| Instruction::Lookup {
+                input: vec![(weights.len() + i, 64)],
+                tp: LookupType::DivRelu(64),
+            })
+            .collect();
+        let program = Program::<Fr>::new(scaled, weights.clone());
+        let trace = program.execute_i64(input.clone());
+        assert_eq!(&trace[out..], &[0, 0, 0, 63, 64, 8191]);
     }
 
     #[test]

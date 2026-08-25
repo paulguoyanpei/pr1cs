@@ -1,20 +1,32 @@
-use std::cmp;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ark_bn254::{Bn254, Fr};
-use ark_ff::{AdditiveGroup, UniformRand};
+use ark_ff::UniformRand;
 use pr1cs::preprocess::Preprocessor;
 use pr1cs::prover::Prover;
 use pr1cs::verifier::Verifier;
-use pr1cs::{circuit::LookupType, instruction::Instruction, program::Program};
+use pr1cs::{
+    circuit::{divrelu_table, LookupType},
+    instruction::Instruction,
+    program::Program,
+};
 use rand::thread_rng;
 use util::kzg::{Mkzg, LOG_CHUNK_SIZE};
 use util::util::RandomOracle;
 
 const KERNEL: usize = 3; // 3x3 conv
+/// Requantization divisor applied after every conv (VerfCNN's `1 << FXP_VALUE`).
+const QUANT: i64 = 64;
+/// The fused quantize+ReLU table covers `[-2^LOG_TABLE_HALF, 2^LOG_TABLE_HALF)`,
+/// i.e. 2^18 rows. That is exactly `util::kzg::LOG_CHUNK_SIZE`, so the table
+/// polynomials still fit in a single KZG chunk and keep an 18-variable domain.
+///
+/// Conv outputs peak around +-76k on CIFAR-10, so this leaves ~1.7x headroom.
+/// Anything outside the range is unprovable and trips `circuit.check`.
+const LOG_TABLE_HALF: usize = 17;
 const LAYER_WEIGHT_LEN: [usize; 14] = [
     1728, 36864, 73728, 147456, 294912, 589824, 589824, 1179648, 2359296, 2359296, 2359296,
     2359296, 2359296, 5120,
@@ -123,13 +135,12 @@ fn build_weight_plan(raw: &[i32]) -> WeightPlan {
                 channels_in = cout;
             }
             Layer::Pool => { /* no weights */ }
-            Layer::Linear(mout) => {
+            Layer::Linear(_) => {
                 let len = LAYER_WEIGHT_LEN[learned_idx];
                 // Linear weight layout (Kin, Mout) identical between VerfCNN
                 // and pr1cs MatMult; copy verbatim.
                 layer_start.push(buf.len());
                 buf.extend(raw[off..off + len].iter().map(|&x| x as i64));
-                let _ = mout;
                 off += len;
                 learned_idx += 1;
             }
@@ -147,8 +158,6 @@ struct ProgramPlan {
     logits_start: usize,
     /// First auxiliary index past the trace (feeds `gen_z`).
     aux_start_hint: usize,
-    /// Start of input block (right after weights).
-    input_start: usize,
 }
 
 /// Build the entire VGG-16 instruction list and return bookkeeping pointers.
@@ -182,34 +191,18 @@ fn build_program(weight_len: usize, input_len: usize, plan: &WeightPlan) -> Prog
                 });
                 next_slot += cout * conv_plane;
 
-                // Div the center n x n of each output channel (discard the
-                // (n+2)x(n+2) border). Order them (d, i, j) so that the Div
-                // block is a contiguous (cout, side, side) feature map.
-                let quant_start = next_slot;
-                for d in 0..cout {
-                    for i in 0..side {
-                        for j in 0..side {
-                            let src = conv_start + d * conv_plane + (i + 1) * conv_side + (j + 1);
-                            instructions.push(Instruction::Div {
-                                input1: vec![(src, 1)],
-                                input2: vec![(0, 1)],
-                                divisor: 64,
-                            });
-                            next_slot += 1;
-                        }
-                    }
-                }
-
-                // ReLU (table lookup) on the Div outputs; same (d, i, j)
-                // ordering so the ReLU block is a contiguous feature map.
+                // Quantize (>> 6) and ReLU the center n x n of each output
+                // channel in a single table lookup, discarding the (n+2)x(n+2)
+                // border. Order them (d, i, j) so the block is a contiguous
+                // (cout, side, side) feature map.
                 let relu_start = next_slot;
                 for d in 0..cout {
                     for i in 0..side {
                         for j in 0..side {
-                            let src = quant_start + d * side * side + i * side + j;
+                            let src = conv_start + d * conv_plane + (i + 1) * conv_side + (j + 1);
                             instructions.push(Instruction::Lookup {
                                 input: vec![(src, 1)],
-                                tp: LookupType::Relu,
+                                tp: LookupType::DivRelu(QUANT),
                             });
                             next_slot += 1;
                         }
@@ -224,7 +217,6 @@ fn build_program(weight_len: usize, input_len: usize, plan: &WeightPlan) -> Prog
                 // 2x2 max pool with stride 2 using `max(a, b) = a + ReLU(b - a)`.
                 let out_side = side / 2;
                 let in_plane = side * side;
-                let out_plane = out_side * out_side;
 
                 // Three ReLUs per output element, then one AddMult to
                 // materialize the pooled value. Emit the ReLUs in a single
@@ -245,22 +237,30 @@ fn build_program(weight_len: usize, input_len: usize, plan: &WeightPlan) -> Prog
                             let r1_slot = relu_block_start + 3 * idx;
                             let r2_slot = relu_block_start + 3 * idx + 1;
 
+                            // Pooling needs a plain ReLU, but scaling the input
+                            // by QUANT lets it share the DivRelu table:
+                            // max((QUANT * t).div_euclid(QUANT), 0) == max(t, 0).
                             // r1 = ReLU(b - a)
                             instructions.push(Instruction::Lookup {
-                                input: vec![(b, 1), (a, -1)],
-                                tp: LookupType::Relu,
+                                input: vec![(b, QUANT), (a, -QUANT)],
+                                tp: LookupType::DivRelu(QUANT),
                             });
                             next_slot += 1;
                             // r2 = ReLU(c - (a + r1))
                             instructions.push(Instruction::Lookup {
-                                input: vec![(cc, 1), (a, -1), (r1_slot, -1)],
-                                tp: LookupType::Relu,
+                                input: vec![(cc, QUANT), (a, -QUANT), (r1_slot, -QUANT)],
+                                tp: LookupType::DivRelu(QUANT),
                             });
                             next_slot += 1;
                             // r3 = ReLU(d - (a + r1 + r2))
                             instructions.push(Instruction::Lookup {
-                                input: vec![(dd, 1), (a, -1), (r1_slot, -1), (r2_slot, -1)],
-                                tp: LookupType::Relu,
+                                input: vec![
+                                    (dd, QUANT),
+                                    (a, -QUANT),
+                                    (r1_slot, -QUANT),
+                                    (r2_slot, -QUANT),
+                                ],
+                                tp: LookupType::DivRelu(QUANT),
                             });
                             next_slot += 1;
                         }
@@ -286,8 +286,6 @@ fn build_program(weight_len: usize, input_len: usize, plan: &WeightPlan) -> Prog
                         }
                     }
                 }
-                let _ = out_plane;
-
                 fm_start = pool_out_start;
                 side = out_side;
             }
@@ -308,12 +306,10 @@ fn build_program(weight_len: usize, input_len: usize, plan: &WeightPlan) -> Prog
                     start2: plan.layer_start[learned_idx],
                 });
                 next_slot += mout;
-                let _ = learned_idx;
                 return ProgramPlan {
                     instructions,
                     logits_start,
                     aux_start_hint: next_slot,
-                    input_start: weight_len,
                 };
             }
         }
@@ -336,7 +332,6 @@ fn main() {
         instructions,
         logits_start,
         aux_start_hint,
-        input_start,
     } = program_plan;
 
     println!(
@@ -346,24 +341,37 @@ fn main() {
         logits_start,
         aux_start_hint,
     );
-    let _ = input_start;
 
     let program = Program::<Fr>::new(instructions, plan.buf);
     let input_i64: Vec<i64> = raw_input.iter().map(|&x| x as i64).collect();
-    let trace = program.execute(input_i64);
-    assert_eq!(trace.len(), aux_start_hint);
+    let trace_i64 = program.execute_i64(input_i64);
+    assert_eq!(trace_i64.len(), aux_start_hint);
+
+    let logits = &trace_i64[logits_start..logits_start + 10];
+    println!("logits: {:?}", logits);
+    // tools/reference.py writes the NumPy reference logits for the same input.
+    let expected = data_path("vgg16_logits.txt");
+    if expected.exists() {
+        let mut txt = String::new();
+        File::open(&expected)
+            .unwrap()
+            .read_to_string(&mut txt)
+            .unwrap();
+        let want: Vec<i64> = txt.split_whitespace().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(logits, want.as_slice(), "logits disagree with reference.py");
+        println!("logits match {}", expected.display());
+    }
+
+    let trace: Vec<Fr> = trace_i64.iter().map(|&x| Fr::from(x)).collect();
 
     let mut rng = thread_rng();
     let gamma = <Fr as UniformRand>::rand(&mut rng);
     let z = program.gen_z(weight_len + input_len, trace, gamma);
 
-    let mut table = vec![];
-    for i in 0..(1 << 6) {
-        table.push((Fr::ZERO, Fr::from(i), Fr::from(LookupType::Range(64).tag())));
-    }
-    for i in (-(1 << 16) + 1)..(1 << 16) {
-        table.push((Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2)));
-    }
+    // Single fused quantize+ReLU table; the program emits no `Div`, so no
+    // remainder range sub-table is needed.
+    let table = divrelu_table::<Fr>(QUANT, 1 << LOG_TABLE_HALF);
+    println!("table rows: {}", table.len());
 
     let circuit = program.to_circuit(input_len, aux_start_hint, table);
     circuit.check(z.clone(), gamma);

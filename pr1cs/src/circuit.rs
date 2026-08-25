@@ -1,6 +1,17 @@
 use ark_ff::PrimeField;
 use std::collections::HashSet;
 
+/// Every `Div` quotient is range-checked into `[-QUOTIENT_BOUND, QUOTIENT_BOUND)`.
+///
+/// The remainder check alone is not enough: `x = divisor * q + r` with `r` in
+/// `[0, divisor)` has exactly `divisor` solutions over the field, since any
+/// `r` pairs with `q = (x - r) / divisor`. Confining `q` to a narrow range
+/// leaves only the honest one.
+///
+/// Programs using `Div` must therefore cover `Bound(QUOTIENT_BOUND)` in their
+/// lookup table.
+pub const QUOTIENT_BOUND: i64 = 1 << 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LookupType {
     Range(i64),
@@ -9,6 +20,14 @@ pub enum LookupType {
     Exp,
     Recip,
     Rsqrt,
+    /// Fused quantize-then-ReLU: `max(input.div_euclid(divisor), 0)`. Folding
+    /// the shift into the table removes the `Div` constraint (and its remainder
+    /// range check) that would otherwise precede a `Relu`.
+    DivRelu(i64),
+    /// Signed range check into `[-bound, bound)`. Unlike `Range`, which pins a
+    /// value the constraints leave at 0, the checked value sits in the lookup
+    /// output column, so no witness slot holds the offset.
+    Bound(i64),
 }
 
 impl LookupType {
@@ -23,8 +42,47 @@ impl LookupType {
             LookupType::Exp => 4,
             LookupType::Recip => 5,
             LookupType::Rsqrt => 6,
+            // Offset past the small tags above; `Range` occupies the negatives.
+            LookupType::DivRelu(divisor) => {
+                assert!(divisor > 0);
+                1_000_000 + divisor
+            }
+            LookupType::Bound(bound) => {
+                assert!(bound > 0);
+                2_000_000 + bound
+            }
         }
     }
+
+    /// Evaluates the lookup types whose meaning this crate fixes itself.
+    /// Returns `None` for types whose contents come from a caller-supplied
+    /// table, and for the range checks, which constrain rather than compute.
+    pub fn eval(self, input: i64) -> Option<i64> {
+        match self {
+            LookupType::Relu => Some(if input > 0 { input } else { 0 }),
+            LookupType::DivRelu(divisor) => {
+                assert!(divisor > 0);
+                // Negative inputs floor to a negative quotient and are clamped
+                // to 0, so this also matches a truncating reference shift.
+                let q = input.div_euclid(divisor);
+                Some(if q > 0 { q } else { 0 })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Rows of a fused quantize+ReLU table covering inputs in `[-half, half)`.
+///
+/// Derived from `LookupType::eval`, so the table a program commits to and the
+/// values `Program::execute` produces cannot drift apart.
+pub fn divrelu_table<F: PrimeField>(divisor: i64, half: i64) -> Vec<(F, F, F)> {
+    assert!(half > 0);
+    let tp = LookupType::DivRelu(divisor);
+    let tag = F::from(tp.tag());
+    (-half..half)
+        .map(|i| (F::from(i), F::from(tp.eval(i).unwrap()), tag))
+        .collect()
 }
 
 #[derive(Debug, Clone)]

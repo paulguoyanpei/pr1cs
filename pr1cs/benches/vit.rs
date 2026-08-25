@@ -4,7 +4,7 @@ use pr1cs::preprocess::Preprocessor;
 use pr1cs::prover::Prover;
 use pr1cs::verifier::Verifier;
 use pr1cs::{
-    circuit::LookupType,
+    circuit::{LookupType, QUOTIENT_BOUND},
     instruction::Instruction,
     program::{LookupTable, Program},
 };
@@ -651,6 +651,16 @@ fn push_range_table(rows: &mut Vec<(Fr, Fr, Fr)>, divisor: i64) {
     }
 }
 
+fn push_bound_table(rows: &mut Vec<(Fr, Fr, Fr)>, bound: i64) {
+    for q in -bound..bound {
+        rows.push((
+            Fr::from(0),
+            Fr::from(q),
+            Fr::from(LookupType::Bound(bound).tag()),
+        ));
+    }
+}
+
 fn push_relu_table(rows: &mut Vec<(Fr, Fr, Fr)>) {
     for i in RELU_MIN..=RELU_MAX {
         rows.push((
@@ -693,6 +703,8 @@ fn build_lookup_table() -> Vec<(Fr, Fr, Fr)> {
     let mut rows = Vec::new();
     push_range_table(&mut rows, C as i64);
     push_range_table(&mut rows, SCALE);
+    // Quotient range check emitted by every `Div`.
+    push_bound_table(&mut rows, QUOTIENT_BOUND);
     push_relu_table(&mut rows);
     push_clamped_lut_table(
         &mut rows,

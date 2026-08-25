@@ -1,11 +1,14 @@
 use ark_bn254::{Bn254, Fr};
-use ark_ff::{AdditiveGroup, UniformRand};
+use ark_ff::UniformRand;
 use pr1cs::preprocess::Preprocessor;
 use pr1cs::prover::Prover;
 use pr1cs::verifier::Verifier;
-use pr1cs::{circuit::LookupType, instruction::Instruction, program::Program};
+use pr1cs::{
+    circuit::{divrelu_table, LookupType},
+    instruction::Instruction,
+    program::Program,
+};
 use rand::thread_rng;
-use std::cmp;
 use std::time::Instant;
 use util::kzg::{Mkzg, LOG_CHUNK_SIZE};
 use util::util::RandomOracle;
@@ -14,6 +17,12 @@ const LAYER_COUNT: usize = 16;
 const HIDDEN_DIM: usize = 128;
 const SEQ_LEN: usize = 1;
 const INPUT_ALIGN: usize = HIDDEN_DIM * SEQ_LEN;
+/// Requantization divisor applied after every matmul.
+const QUANT: i64 = 64;
+/// The fused quantize+ReLU table covers `[-2^LOG_TABLE_HALF, 2^LOG_TABLE_HALF)`.
+/// Weights are the identity and the input is constant, so every pre-division
+/// value stays in {0, 1, 64}; this leaves ample headroom.
+const LOG_TABLE_HALF: usize = 12;
 
 fn instructions(weight_len: usize) -> Vec<Instruction> {
     let mut instructions = vec![];
@@ -29,24 +38,17 @@ fn instructions(weight_len: usize) -> Vec<Instruction> {
             start2: weight_start,
         });
 
+        // Quantize (>> 6) and ReLU in a single table lookup, so the layer needs
+        // no `Div` and hence no remainder or quotient range check.
         let matmul_start = input_start + INPUT_ALIGN;
         for offset in 0..INPUT_ALIGN {
-            instructions.push(Instruction::Div {
-                input1: vec![(matmul_start + offset, 1)],
-                input2: vec![(0, 1)],
-                divisor: 64,
-            });
-        }
-
-        let quant_start = matmul_start + INPUT_ALIGN;
-        for offset in 0..INPUT_ALIGN {
             instructions.push(Instruction::Lookup {
-                input: vec![(quant_start + offset, 1)],
-                tp: LookupType::Relu,
+                input: vec![(matmul_start + offset, 1)],
+                tp: LookupType::DivRelu(QUANT),
             });
         }
 
-        input_start = quant_start + INPUT_ALIGN;
+        input_start = matmul_start + INPUT_ALIGN;
         weight_start += HIDDEN_DIM * HIDDEN_DIM;
     }
 
@@ -77,20 +79,17 @@ fn main() {
     let trace = program.execute(input);
     assert_eq!(
         trace.len(),
-        1 + LAYER_COUNT * HIDDEN_DIM * HIDDEN_DIM + INPUT_ALIGN + LAYER_COUNT * INPUT_ALIGN * 3
+        1 + LAYER_COUNT * HIDDEN_DIM * HIDDEN_DIM + INPUT_ALIGN + LAYER_COUNT * INPUT_ALIGN * 2
     );
     let aux_start = trace.len();
 
     let gamma = <Fr as UniformRand>::rand(&mut rng);
     let z = program.gen_z(weight_len + INPUT_ALIGN, trace, gamma);
 
-    let mut table = vec![];
-    for i in 0..(1 << 6) {
-        table.push((Fr::ZERO, Fr::from(i), Fr::from(LookupType::Range(64).tag())));
-    }
-    for i in (-(1 << 16) + 1)..(1 << 16) {
-        table.push((Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2)));
-    }
+    // Single fused quantize+ReLU table; the program emits no `Div`, so it needs
+    // neither a remainder nor a quotient range sub-table.
+    let table = divrelu_table::<Fr>(QUANT, 1 << LOG_TABLE_HALF);
+    println!("table rows: {}", table.len());
     let circuit = program.to_circuit(INPUT_ALIGN, aux_start, table);
     circuit.check(z.clone(), gamma);
 
@@ -102,7 +101,6 @@ fn main() {
     let proof = prover.prove(z, gamma, &mut ro);
     println!("proof size {} bytes", proof.size());
     let verifier = Verifier::new(vk);
-    let _ = weight_len;
     let verifier_start = Instant::now();
     verifier.verify(proof, gamma, &mut ro);
     let verifier_time = verifier_start.elapsed().as_millis();

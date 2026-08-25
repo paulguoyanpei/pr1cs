@@ -96,7 +96,12 @@ The `pr1cs/tools` directory contains helpers for benchmark data:
 - `reference.py`: runs a NumPy reference pass for the shipped VGG16 integer
   data and writes `vgg16_logits.txt`.
 - `dump_weights.cpp`: helper for converting VerfCNN-style weights into the
-  binary layout consumed by the VGG16 benchmark.
+  binary layout consumed by the VGG16 benchmark. Build it with
+  `build_dump_weights.sh`, which expects a VerfCNN checkout as a sibling of the
+  workspace root (override with `VERFCNN_DIR`).
+- `export_vgg16_input.py`: quantizes one CIFAR-10 test image into
+  `vgg16_input.bin` / `vgg16_label.txt`, mirroring VerfCNN's `main.py`
+  preprocessing. Needs NumPy, PyArrow, and Pillow.
 - `export_vit.py`: exports fixed-point DeiT-Tiny inputs, parameters, lookup
   tables, and reference logits for the ViT benchmark.
 - `check_vit_logits.py`: compares PR1CS ViT integer logits with exported

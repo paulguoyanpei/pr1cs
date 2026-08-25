@@ -92,7 +92,7 @@ mod tests {
 
     use super::Preprocessor;
     use crate::{
-        circuit::{Circuit, LookupType, SparseMatrix},
+        circuit::{Circuit, LookupType, SparseMatrix, QUOTIENT_BOUND},
         instruction::Instruction,
         program::Program,
         prover::Prover,
@@ -177,6 +177,17 @@ mod tests {
                 .map(|i| (Fr::from(i), Fr::from(cmp::max(0, i)), Fr::from(2u64)))
                 .collect::<Vec<_>>(),
         );
+        // Quotient range check for the `Div`. The rows present in the table are
+        // what the constraint actually enforces, so this narrow window around
+        // the honest quotient keeps the test cheap while still pinning `q`;
+        // real programs emit the full `Bound(QUOTIENT_BOUND)` sub-table.
+        table.extend((-64i64..=64).map(|i| {
+            (
+                Fr::from(0),
+                Fr::from(i),
+                Fr::from(LookupType::Bound(QUOTIENT_BOUND).tag()),
+            )
+        }));
         program.to_circuit(input.len(), trace.len(), table)
     }
 
