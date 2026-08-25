@@ -13,6 +13,10 @@ rayon = "1.10"
 util = { path = "../util" }
 
 [[bench]]
+name = "registration"
+harness = false
+
+[[bench]]
 name = "dnn"
 harness = false
 

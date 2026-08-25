@@ -24,7 +24,7 @@ activations such as ReLU, GELU, exp, reciprocal, and reciprocal square root.
 ## Crates
 
 - `pr1cs`: exposes the circuit, instruction, program, preprocessing, prover,
-  verifier, and sparse proof modules.
+  verifier, sparse proof, and model registration modules.
 - `util`: provides multilinear polynomial utilities, a random oracle, and the
   `Mkzg` multilinear KZG commitment implementation used by `pr1cs`.
 
@@ -66,15 +66,60 @@ A typical proof pipeline is:
 
 1. Build a `Program` from `Instruction` values and integer weights.
 2. Execute the program on integer inputs to produce a trace.
-3. Convert the program into a `Circuit`.
+3. Compile the program into a `Circuit` with `Program::compile`.
 4. Generate KZG parameters and preprocess the circuit.
-5. Produce a proof with `Prover`.
-6. Verify it with `Verifier`.
+5. Register the model once with `Registrar::register` (see below).
+6. Produce a proof with `Prover`.
+7. Verify it with `Verifier`.
 
 The `pr1cs/benches/dnn.rs` benchmark is the smallest end-to-end example. It
 constructs a layered integer network, creates range and ReLU lookup tables,
 checks the resulting circuit, proves the execution trace, and verifies the
 proof.
+
+## Model Registration
+
+A committed circuit on its own only defines an NP relation, so the same input
+could admit several accepting outputs. `pr1cs::registration` closes that gap
+with the one-time certificate of the paper's Section 5.3: it proves that the
+committed pR1CS descriptor is the compilation of a valid private VM program,
+
+```text
+R_reg = {(cm_C, cm_p); (P, C, p) : C = Compile(P) != bottom, Open(cm_C, C), Open(cm_p, p)}
+```
+
+against the same `VerifierKey` the online proofs are verified against.
+
+```rust
+let circuit = program.compile(input_len, aux_start, table)?;   // Compile, or bottom
+let (pk, vk) = Preprocessor::build(kzg_pp, kzg_vp, circuit);
+let enc = ProgramEncoding::from_program(&program, input_len, aux_start);
+let (key, cert) = Registrar::register(&pk, &vk, &enc, &mut ro)?;
+Registrar::verify(&vk, &key, cert, &mut ro);
+```
+
+Two halves make it up:
+
+- `Program::compile` enforces program validity (`P` in the paper's set of
+  valid programs): instructions read only the parameters, the public input and
+  a prefix of the trace, never the advice region; divisors are positive; every
+  lookup type the program uses is covered by the public table and is a
+  function on it. Invalid programs return a `CompileError` instead of a
+  circuit. `to_circuit` is the panicking wrapper.
+- `Registrar` proves the compilation relation over the committed vectors.
+  `registration::encode::check_compilation` states the same rules in the clear
+  and is what the argument is tested against.
+
+`RegistrationKey` is what a registered model publishes alongside its circuit
+commitment: the public size profile plus commitments to the program.
+
+`cargo bench --bench registration` times the certificate on a fully connected
+DNN; `LAYERS` and `HIDDEN` set the model size.
+
+Scope note: like the rest of the crate, the argument targets binding and
+soundness. The hiding layer (blinded commitments and re-masked sumchecks) is
+not implemented for the online proof either, so a registration transcript is
+not yet zero-knowledge.
 
 ## Supported Instructions
 
@@ -88,6 +133,10 @@ proof.
 - `Lookup`: table lookup constraints for nonlinear or quantized operations.
 
 Lookup types are defined in `pr1cs::circuit::LookupType`.
+
+Only matrix `B` keeps its parameter columns through preprocessing, so a
+program has to read model parameters on the `B` side of a constraint;
+`compile` rejects programs that do otherwise.
 
 ## Data Tools
 

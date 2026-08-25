@@ -1,4 +1,8 @@
-use std::{collections::HashMap, marker::PhantomData};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    marker::PhantomData,
+};
 
 use ark_ff::PrimeField;
 
@@ -6,6 +10,98 @@ use crate::{
     circuit::{Circuit, LookupType, SparseMatrix, QUOTIENT_BOUND},
     instruction::Instruction,
 };
+
+/// Why `Program::compile` rejected a program, i.e. the cases in which the
+/// paper's `Compile(P)` returns bottom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompileError {
+    /// An instruction reads a trace cell that no earlier instruction wrote.
+    ReadsFutureTrace {
+        instr: usize,
+        col: usize,
+        limit: usize,
+    },
+    /// An instruction reads the advice region, which the VM never exposes to
+    /// programs because the prover picks its contents.
+    ReadsAdvice {
+        instr: usize,
+        col: usize,
+        aux_start: usize,
+    },
+    /// `Div` divisors have to be positive for the quotient to be well defined.
+    NonPositiveDivisor { instr: usize, divisor: i64 },
+    /// A `MatMult` or `Conv` operand has a zero dimension.
+    ZeroDimension { instr: usize },
+    /// The public table has no rows for a lookup type the program uses.
+    MissingLookupRows { instr: usize, tag: i64 },
+    /// The public table sends one `(input, type)` pair to two outputs, so the
+    /// lookup it defines is not a function.
+    AmbiguousTable { row: usize },
+    /// A range-check type appeared as a standalone `Lookup`. Those types
+    /// constrain rather than compute, so they leave their output cell free.
+    ReservedLookupType { instr: usize, tag: i64 },
+    /// A matrix other than `B` reads a model parameter. Only `B` keeps its
+    /// parameter columns in the committed descriptor, so such a read would be
+    /// dropped during preprocessing instead of constraining anything.
+    ParameterReadOutsideB { instr: usize, col: usize },
+    /// The semantic trace does not end where the advice region starts.
+    TraceLengthMismatch { trace_end: usize, aux_start: usize },
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadsFutureTrace { instr, col, limit } => write!(
+                f,
+                "instruction {} reads z[{}], past the trace prefix z[..{}]",
+                instr, col, limit
+            ),
+            Self::ReadsAdvice {
+                instr,
+                col,
+                aux_start,
+            } => write!(
+                f,
+                "instruction {} reads z[{}], inside the advice region z[{}..]",
+                instr, col, aux_start
+            ),
+            Self::NonPositiveDivisor { instr, divisor } => {
+                write!(f, "instruction {} divides by {}", instr, divisor)
+            }
+            Self::ZeroDimension { instr } => {
+                write!(f, "instruction {} has a zero dimension", instr)
+            }
+            Self::MissingLookupRows { instr, tag } => write!(
+                f,
+                "instruction {} uses lookup tag {}, which the table does not cover",
+                instr, tag
+            ),
+            Self::AmbiguousTable { row } => write!(
+                f,
+                "table row {} repeats an earlier (input, type) pair with a different output",
+                row
+            ),
+            Self::ReservedLookupType { instr, tag } => write!(
+                f,
+                "instruction {} uses range-check tag {} as a standalone lookup",
+                instr, tag
+            ),
+            Self::ParameterReadOutsideB { instr, col } => write!(
+                f,
+                "instruction {} reads parameter z[{}] on a side other than B",
+                instr, col
+            ),
+            Self::TraceLengthMismatch {
+                trace_end,
+                aux_start,
+            } => write!(
+                f,
+                "trace ends at {} but the advice region starts at {}",
+                trace_end, aux_start
+            ),
+        }
+    }
+}
 
 pub struct Program<F: PrimeField> {
     instructions: Vec<Instruction>,
@@ -56,12 +152,21 @@ impl<F: PrimeField> Program<F> {
         }
     }
 
-    pub fn to_circuit(
+    /// Compiles the program into its canonical pR1CS circuit, or reports why
+    /// the program is not in `P`, the set of valid VM programs. This is the
+    /// paper's `Compile`, including the cases where it returns bottom.
+    ///
+    /// The validity conditions are what make the compiled circuit
+    /// output-binding: every instruction may read only the model parameters,
+    /// the public input and a prefix of the semantic trace, and no instruction
+    /// may read the advice region, whose contents the prover picks freely.
+    pub fn compile(
         &self,
         input_size: usize,
         aux_start: usize,
         table: Vec<(F, F, F)>,
-    ) -> Circuit<F> {
+    ) -> Result<Circuit<F>, CompileError> {
+        let tags = self.table_tags(&table)?;
         let mut a = SparseMatrix::<F>::new();
         let mut b = SparseMatrix::<F>::new();
         let mut c = SparseMatrix::<F>::new();
@@ -71,9 +176,12 @@ impl<F: PrimeField> Program<F> {
         let mut output_index = self.weights.len() + input_size;
         let mut auxiliary_index = aux_start;
 
-        for instr in &self.instructions {
+        for (instr_idx, instr) in self.instructions.iter().enumerate() {
             match &instr {
                 &Instruction::AddMult { input1, input2 } => {
+                    Self::check_no_parameter_read(instr_idx, input1, self.weights.len())?;
+                    Self::check_reads(instr_idx, input1, output_index, aux_start)?;
+                    Self::check_reads(instr_idx, input2, output_index, aux_start)?;
                     a.append(input1);
                     b.append(input2);
                     c.append(&vec![(output_index, 1)]);
@@ -93,10 +201,35 @@ impl<F: PrimeField> Program<F> {
                     let out_channels = *out_channels;
                     let start1 = *start1;
                     let start2 = *start2;
+                    if n == 0 || m == 0 || in_channels == 0 || out_channels == 0 {
+                        return Err(CompileError::ZeroDimension {
+                            instr: instr_idx,
+                        });
+                    }
                     let side = n + m - 1;
                     let plane = side * side;
                     let input_plane = n * n;
                     let kernel_plane = m * m;
+                    if start1 < self.weights.len() {
+                        return Err(CompileError::ParameterReadOutsideB {
+                            instr: instr_idx,
+                            col: start1,
+                        });
+                    }
+                    Self::check_block(
+                        instr_idx,
+                        start1,
+                        in_channels * input_plane,
+                        output_index,
+                        aux_start,
+                    )?;
+                    Self::check_block(
+                        instr_idx,
+                        start2,
+                        in_channels * out_channels * kernel_plane,
+                        output_index,
+                        aux_start,
+                    )?;
 
                     // One product gate per input channel, then one final sum gate.
                     for ch in 0..in_channels {
@@ -164,6 +297,22 @@ impl<F: PrimeField> Program<F> {
                     input,
                     tp: lookup_type,
                 } => {
+                    let tag = lookup_type.tag();
+                    match lookup_type {
+                        LookupType::Range(_) | LookupType::Bound(_) => {
+                            // Emitted only as part of `Div`; as a standalone
+                            // instruction they would constrain rather than
+                            // compute, leaving the output cell unpinned.
+                            return Err(CompileError::ReservedLookupType {
+                                instr: instr_idx,
+                                tag,
+                            });
+                        }
+                        _ => {}
+                    }
+                    Self::check_no_parameter_read(instr_idx, input, self.weights.len())?;
+                    Self::check_reads(instr_idx, input, output_index, aux_start)?;
+                    Self::check_tag(instr_idx, tag, &tags)?;
                     d.append(input);
                     e.append(&vec![(output_index, 1)]);
                     tp.push(lookup_type.clone());
@@ -175,7 +324,21 @@ impl<F: PrimeField> Program<F> {
                     divisor,
                 } => {
                     let divisor = *divisor;
-                    assert!(divisor > 0);
+                    if divisor <= 0 {
+                        return Err(CompileError::NonPositiveDivisor {
+                            instr: instr_idx,
+                            divisor,
+                        });
+                    }
+                    Self::check_no_parameter_read(instr_idx, input1, self.weights.len())?;
+                    Self::check_reads(instr_idx, input1, output_index, aux_start)?;
+                    Self::check_reads(instr_idx, input2, output_index, aux_start)?;
+                    Self::check_tag(instr_idx, LookupType::Range(divisor).tag(), &tags)?;
+                    Self::check_tag(
+                        instr_idx,
+                        LookupType::Bound(QUOTIENT_BOUND).tag(),
+                        &tags,
+                    )?;
                     a.append(input1);
                     b.append(input2);
                     c.append(&vec![(output_index, divisor), (auxiliary_index, 1)]);
@@ -204,6 +367,19 @@ impl<F: PrimeField> Program<F> {
                     let k = *k;
                     let start1 = *start1;
                     let start2 = *start2;
+                    if m == 0 || n == 0 || k == 0 {
+                        return Err(CompileError::ZeroDimension {
+                            instr: instr_idx,
+                        });
+                    }
+                    if start1 < self.weights.len() {
+                        return Err(CompileError::ParameterReadOutsideB {
+                            instr: instr_idx,
+                            col: start1,
+                        });
+                    }
+                    Self::check_block(instr_idx, start1, n * m, output_index, aux_start)?;
+                    Self::check_block(instr_idx, start2, n * k, output_index, aux_start)?;
 
                     // Compute P^T * gamma_1
                     // Select n * m values of P^T
@@ -253,8 +429,18 @@ impl<F: PrimeField> Program<F> {
             }
         }
 
+        // The semantic trace has to end exactly where the advice region
+        // begins; otherwise the two regions overlap and an instruction could
+        // read prover-chosen advice through a trace index.
+        if output_index != aux_start {
+            return Err(CompileError::TraceLengthMismatch {
+                trace_end: output_index,
+                aux_start,
+            });
+        }
+
         let z_len = auxiliary_index;
-        return Circuit::<F>::new(
+        Ok(Circuit::<F>::new(
             a,
             b,
             c,
@@ -265,7 +451,137 @@ impl<F: PrimeField> Program<F> {
             self.weights.len(),
             z_len,
             table,
-        );
+        ))
+    }
+
+    /// Panicking wrapper around [`Program::compile`], kept for callers that
+    /// build their programs statically.
+    pub fn to_circuit(
+        &self,
+        input_size: usize,
+        aux_start: usize,
+        table: Vec<(F, F, F)>,
+    ) -> Circuit<F> {
+        self.compile(input_size, aux_start, table)
+            .unwrap_or_else(|err| panic!("invalid program: {}", err))
+    }
+
+    fn check_reads(
+        instr: usize,
+        row: &Vec<(usize, i64)>,
+        limit: usize,
+        aux_start: usize,
+    ) -> Result<(), CompileError> {
+        for &(col, _) in row {
+            Self::check_read(instr, col, limit, aux_start)?;
+        }
+        Ok(())
+    }
+
+    fn check_read(
+        instr: usize,
+        col: usize,
+        limit: usize,
+        aux_start: usize,
+    ) -> Result<(), CompileError> {
+        if col >= aux_start {
+            return Err(CompileError::ReadsAdvice {
+                instr,
+                col,
+                aux_start,
+            });
+        }
+        if col >= limit {
+            return Err(CompileError::ReadsFutureTrace { instr, col, limit });
+        }
+        Ok(())
+    }
+
+    /// Checks a contiguous operand block `[start, start + len)`.
+    fn check_block(
+        instr: usize,
+        start: usize,
+        len: usize,
+        limit: usize,
+        aux_start: usize,
+    ) -> Result<(), CompileError> {
+        if len == 0 {
+            return Err(CompileError::ZeroDimension { instr });
+        }
+        Self::check_read(instr, start, limit, aux_start)?;
+        Self::check_read(instr, start + len - 1, limit, aux_start)
+    }
+
+    /// Only matrix `B` keeps its parameter columns through preprocessing, so
+    /// every other side has to read parameters indirectly.
+    fn check_no_parameter_read(
+        instr: usize,
+        row: &Vec<(usize, i64)>,
+        weight_len: usize,
+    ) -> Result<(), CompileError> {
+        for &(col, _) in row {
+            if col < weight_len {
+                return Err(CompileError::ParameterReadOutsideB { instr, col });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_tag(instr: usize, tag: i64, tags: &HashSet<F>) -> Result<(), CompileError> {
+        if tags.contains(&F::from(tag)) {
+            Ok(())
+        } else {
+            Err(CompileError::MissingLookupRows { instr, tag })
+        }
+    }
+
+    /// Collects the lookup-type tags the public table covers.
+    ///
+    /// For every type a `Lookup` instruction reads a value from, the table has
+    /// to send each input to at most one output; that uniqueness is what makes
+    /// the instruction deterministic. The range-check types `Range` and
+    /// `Bound` are exempt: they pin a value that already sits in the witness
+    /// rather than producing one, so their rows deliberately repeat the same
+    /// input with different outputs.
+    fn table_tags(&self, table: &[(F, F, F)]) -> Result<HashSet<F>, CompileError> {
+        let deterministic = self
+            .instructions
+            .iter()
+            .filter_map(|instr| match instr {
+                // `Range` and `Bound` are rejected below as standalone
+                // lookups, so their rows are never required to be a function.
+                Instruction::Lookup {
+                    tp: LookupType::Range(_) | LookupType::Bound(_),
+                    ..
+                } => None,
+                Instruction::Lookup { tp, .. } => Some(F::from(tp.tag())),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+
+        let mut outputs = HashMap::new();
+        let mut tags = HashSet::new();
+        for (row, &(i, j, k)) in table.iter().enumerate() {
+            if deterministic.contains(&k) {
+                if let Some(&seen) = outputs.get(&(i, k)) {
+                    if seen != j {
+                        return Err(CompileError::AmbiguousTable { row });
+                    }
+                } else {
+                    outputs.insert((i, k), j);
+                }
+            }
+            tags.insert(k);
+        }
+        Ok(tags)
+    }
+
+    pub fn instructions(&self) -> &[Instruction] {
+        &self.instructions
+    }
+
+    pub fn weight_len(&self) -> usize {
+        self.weights.len()
     }
 
     pub fn weights(&self) -> Vec<F> {

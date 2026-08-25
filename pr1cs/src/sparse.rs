@@ -139,7 +139,7 @@ impl<F: PrimeField> SparseEvals<F> {
     }
 }
 
-fn log2_ceil(n: usize) -> usize {
+pub(crate) fn log2_ceil(n: usize) -> usize {
     if n <= 1 {
         1
     } else {
@@ -147,7 +147,7 @@ fn log2_ceil(n: usize) -> usize {
     }
 }
 
-fn identity_mle<F: Field>(point: &[F]) -> F {
+pub(crate) fn identity_mle<F: Field>(point: &[F]) -> F {
     let mut acc = F::zero();
     let mut pow = F::one();
     let two = F::from(2u8);
@@ -200,7 +200,7 @@ fn combined_row_mle<F: PrimeField>(point_abc: &[F], point_de: &[F], point: &[F])
 }
 
 // MLE of indicator [i < n] at `point`.
-fn prefix_mle<F: Field>(point: &[F], n: usize) -> F {
+pub(crate) fn prefix_mle<F: Field>(point: &[F], n: usize) -> F {
     let nv = point.len();
     if n == 0 {
         return F::zero();
@@ -606,7 +606,7 @@ fn gkr_layer_sumcheck_prove<E: Pairing>(
     (new_point, final_claims)
 }
 
-fn gkr_fractional_sum_prove<E: Pairing>(
+pub(crate) fn gkr_fractional_sum_prove<E: Pairing>(
     p_leaf: Vec<E::ScalarField>,
     q_leaf: Vec<E::ScalarField>,
     claim: E::ScalarField,
@@ -726,7 +726,7 @@ fn sumcheck_vrho_consistency<E: Pairing>(
 // Sumcheck helpers: verifier side.
 // ============================================================
 
-fn init_base<F: PrimeField>(n: usize) -> Vec<F> {
+pub(crate) fn init_base<F: PrimeField>(n: usize) -> Vec<F> {
     let mut res = vec![];
     for i in 0..n + 1 {
         let mut prod = F::one();
@@ -741,7 +741,7 @@ fn init_base<F: PrimeField>(n: usize) -> Vec<F> {
     res
 }
 
-fn uni_extrapolate<F: PrimeField>(base: &Vec<F>, v: &Vec<F>, x: F) -> F {
+pub(crate) fn uni_extrapolate<F: PrimeField>(base: &Vec<F>, v: &Vec<F>, x: F) -> F {
     let n = base.len() - 1;
     let mut prod = x;
     for i in 1..n + 1 {
@@ -758,7 +758,7 @@ fn uni_extrapolate<F: PrimeField>(base: &Vec<F>, v: &Vec<F>, x: F) -> F {
     res * prod
 }
 
-fn verifier_sumcheck<E: Pairing>(
+pub(crate) fn verifier_sumcheck<E: Pairing>(
     mut y: E::ScalarField,
     nv: usize,
     degree: usize,
@@ -777,7 +777,7 @@ fn verifier_sumcheck<E: Pairing>(
     (new_point, y)
 }
 
-fn gkr_fractional_sum_verify<E: Pairing>(
+pub(crate) fn gkr_fractional_sum_verify<E: Pairing>(
     claim: E::ScalarField,
     log_len: usize,
     proof: &mut Proof<E>,

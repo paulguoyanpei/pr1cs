@@ -20,6 +20,12 @@ pub struct MkzgVerParams<E: Pairing> {
 }
 
 impl<E: Pairing> MkzgVerParams<E> {
+    /// Number of variables these parameters can verify, i.e. the log of the
+    /// chunk size openings are padded to.
+    pub fn log_len(&self) -> usize {
+        self.params.len()
+    }
+
     pub fn trim(&self, log_len: usize) -> Self {
         let mut params = self.params.clone();
         params.truncate(log_len);
